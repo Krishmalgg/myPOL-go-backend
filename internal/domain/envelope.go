@@ -78,7 +78,10 @@ var reliableEvents = map[string]struct{}{
 	"block.lock.request":     {},
 	"block.lock.renew":       {},
 	"block.lock.release":     {},
+	"block.created":          {},
+	"block.status":           {},
 	"auth.refresh":           {},
+	"server.draining":        {},
 	"interest.update":        {},
 	"yjs.update":             {},
 }
@@ -118,6 +121,11 @@ func ClassifyEvent(event string) EventClass {
 // must not be able to change it. Enforced here rather than trusting the client
 // to hide its own toolbar.
 func (p Permission) MayPublish(event string) bool {
+	// Lifecycle control is server-authored. It is reliable so existing clients
+	// can consume it as control JSON, but no client may impersonate a drain.
+	if event == "server.draining" {
+		return false
+	}
 	switch ClassifyEvent(event) {
 	case ClassDurable:
 		// Never client-relayable, whatever the permission.

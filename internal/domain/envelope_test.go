@@ -13,6 +13,8 @@ func TestClassifyEvent(t *testing.T) {
 		"ink.commit":             ClassReliable,
 		"ink.ended":              ClassReliable,
 		"block.transform.commit": ClassReliable,
+		"block.created":          ClassReliable,
+		"block.status":           ClassReliable,
 		"auth.refresh":           ClassReliable,
 
 		"rtc.offer":     ClassSignaling,
@@ -58,12 +60,24 @@ func TestViewersMayBePresentButNotDraw(t *testing.T) {
 		if permission.MayPublish("block.transform.commit") {
 			t.Errorf("%s must not be able to move blocks", permission)
 		}
+		// A viewer may watch a media upload happen but must not be able to
+		// announce one — that would let a read-only participant conjure a
+		// block into a canvas they have no write access to.
+		if permission.MayPublish("block.created") {
+			t.Errorf("%s must not be able to announce a new block", permission)
+		}
+		if permission.MayPublish("block.status") {
+			t.Errorf("%s must not be able to announce media progress", permission)
+		}
 	}
 }
 
 func TestEditorsMayDraw(t *testing.T) {
 	for _, permission := range []Permission{PermissionEdit, PermissionOwner} {
-		for _, event := range []string{"cursor.moved", "ink.started", "ink.points", "ink.commit"} {
+		for _, event := range []string{
+			"cursor.moved", "ink.started", "ink.points", "ink.commit",
+			"block.created", "block.status",
+		} {
 			if !permission.MayPublish(event) {
 				t.Errorf("%s should be allowed to publish %q", permission, event)
 			}

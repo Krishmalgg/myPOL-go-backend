@@ -13,12 +13,37 @@ Session and security foundation for the collaborative canvas. Canvas traffic
   presence, and an envelope-v2 relay with separate ephemeral and reliable
   queues, per-connection token-bucket rate limits, and permission enforced by
   message class.
+- Serves **WebTransport over HTTP/3** on its own listener, carrying previews as
+  datagrams and final state on a reused reliable stream. Rooms, presence,
+  permissions and rate limits are the same code as the WebSocket path — a second
+  way in must not be a weaker one.
 - Exposes an HMAC-authenticated internal control plane so .NET can revoke access
   immediately rather than waiting for a token to expire — revocation closes live
   sockets, and a permission change is applied in place without dropping them.
 
-WebTransport, WebRTC signalling, interest filtering and the binary codec are
-later phases and deliberately absent.
+- Routes **WebRTC signalling** peer to peer. `rtc.offer` / `rtc.answer` /
+  `rtc.candidate` are delivered to exactly one named connection in the sender's
+  own room, never broadcast, and are refused entirely once a room exceeds
+  `WEBRTC_MAX_PEERS`. ICE configuration is served from the authenticated
+  bootstrap so TURN credentials stay out of the frontend bundle.
+
+Interest filtering and the binary codec are later phases and deliberately absent.
+Go is a signalling *router* only — it never participates in the negotiation, and
+perfect negotiation is the browser's responsibility.
+
+### Enabling WebTransport locally
+
+```bash
+openssl ecparam -genkey -name prime256v1 -noout -out wt.key
+openssl req -x509 -new -key wt.key -out wt.crt -days 365 \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+export WEBTRANSPORT_ADDR=:8443 TLS_CERT_FILE=./wt.crt TLS_KEY_FILE=./wt.key
+```
+
+Browsers reject self-signed certificates for WebTransport unless Chrome is
+started with `--origin-to-force-quic-on` and a `--ignore-certificate-errors-spki-list`
+hash, so a locally trusted certificate is easier for manual testing.
 
 ## Run
 
@@ -49,6 +74,7 @@ openssl ec -in canvas.key -pubout -out canvas-public.pem              # -> Go
 | `GET` | `/readyz` | none | Readiness — 503 while draining |
 | `POST` | `/v1/sessions/bootstrap` | Canvas JWT (Bearer) | Session + connection ticket |
 | `GET` | `/ws?ticket=…` | One-time ticket | Canvas WebSocket: rooms, presence, relay |
+| `GET` | `/wt?ticket=…` | One-time ticket | Canvas WebTransport (HTTP/3), separate listener |
 | `POST` | `/internal/v1/sessions/revoke` | HMAC | End one session |
 | `POST` | `/internal/v1/sessions/permission` | HMAC | Change a live session's permission |
 | `POST` | `/internal/v1/notes/{noteId}/users/{userId}/revoke` | HMAC | End every session a user holds on a note |
@@ -71,7 +97,12 @@ openssl ec -in canvas.key -pubout -out canvas-public.pem              # -> Go
 | `SESSION_HEARTBEAT_SECONDS` | `15` | Advertised to clients |
 | `SESSION_IDLE_TIMEOUT_SECONDS` | `45` | |
 | `WEBSOCKET_URL` / `WEBTRANSPORT_URL` | — | Advertised at bootstrap; WT omitted when empty |
-| `WEBRTC_MAX_PEERS` | `6` | |
+| `WEBTRANSPORT_ADDR` | — | UDP listener for HTTP/3. Empty disables WebTransport |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | — | Required for WebTransport; QUIC has no plaintext mode |
+| `MAX_DATAGRAM_BYTES` | `1100` | Frames above this fall back to the reliable stream |
+| `WEBRTC_MAX_PEERS` | `6` | Room size above which signalling is refused |
+| `STUN_URLS` | `stun:stun.l.google.com:19302` | Comma separated |
+| `TURN_URLS` / `TURN_USERNAME` / `TURN_CREDENTIAL` | — | Served via bootstrap, never to the bundle |
 | `SHUTDOWN_GRACE_SECONDS` | `5` | |
 
 No secret has a usable default: an unset HMAC secret leaves the control plane
@@ -110,3 +141,28 @@ go-realtime/
 ```bash
 GOFLAGS=-buildvcs=false go test ./...
 ```
+# Load testing
+
+Phase 19 tooling lives in `cmd/loadtest`. It uses the real bootstrap/ticket
+flow and supports Go WebSocket and WebTransport, JSON and binary previews, and
+the `distributed`, `mostly-viewing`, `multi-page`, `viewports`, and `hotspot`
+scenarios. It records preview p50/p95/p99, messages/sec, bytes, commit relay
+delivery, interest fan-out, queue depth, and dropped ephemeral frames.
+
+Run it from this directory with a local development key matching the server's
+public key:
+
+```powershell
+go run ./cmd/loadtest -base-url http://127.0.0.1:8081 -connections 100 -duration 30s -scenario hotspot -transport websocket -encoding json -report ..\docs\performance\canvas-realtime-load-test-report.md
+```
+
+For 500/1000-user runs, raise the server bootstrap IP burst/rate for the test
+and use a separate report file per matrix cell. Use
+`scripts/run-load-test.ps1 -ServerPid <pid>` to capture Windows CPU/RAM beside
+the runner output. The full matrix and interpretation rules are in
+`docs/performance/canvas-realtime-load-test-report.md`.
+
+The runner deliberately does not call a signaling-only path a WebRTC capacity
+test. WebRTC small-room results require real browser ICE/DataChannel peers and
+must be recorded separately. Do not publish a same-viewport capacity number
+until the hotspot row also has browser FPS and main-thread measurements.

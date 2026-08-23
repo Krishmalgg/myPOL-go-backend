@@ -3,52 +3,44 @@ package transport
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 
+	"mypol/go-realtime/internal/codec"
 	"mypol/go-realtime/internal/domain"
+	"mypol/go-realtime/internal/observability"
 )
 
-var errReliableQueueFull = errors.New("reliable queue full")
+// Eight milliseconds keeps server-side coalescing below one 60Hz display
+// frame. Browser batching still collapses duplicate state, while recipients no
+// longer pay two full frame windows before a preview can be painted.
+const ephemeralFlushInterval = 8 * time.Millisecond
+const maxEphemeralAggregateFrames = 64
 
 // wsConnection is one authenticated WebSocket attached to a canvas room.
 //
 // Sends never touch the socket directly. Everything is queued and drained by a
 // single writer goroutine, because a WebSocket permits only one concurrent
-// writer and because it is the queues — not the socket — that let ephemeral and
-// reliable traffic have different failure behaviour.
+// writer — and because the queues are what give ephemeral and reliable traffic
+// their different failure behaviour.
 type wsConnection struct {
+	*outboundQueues
+
 	id        string
 	sessionID string
 	userID    string
 	noteID    string
 
-	mu         sync.RWMutex
-	permission domain.Permission
+	mu              sync.RWMutex
+	permission      domain.Permission
+	binaryFrames    bool
+	aggregateFrames bool
 
-	socket *websocket.Conn
-
-	// ephemeral is newest-wins per coalesce key. A slow reader loses stale
-	// frames rather than accumulating every frame produced while it was slow.
-	ephemeralMu    sync.Mutex
-	ephemeral      map[string]*domain.Envelope
-	ephemeralOrder []string
-	maxEphemeral   int
-	dropped        uint64
-
-	// reliable is a bounded FIFO that refuses rather than discards.
-	reliable chan *domain.Envelope
-
-	// wake signals the writer that work is queued, without blocking the sender.
-	wake chan struct{}
-
+	socket      *websocket.Conn
+	metrics     *observability.Metrics
 	connectedAt time.Time
-	closeOnce   sync.Once
-	closed      chan struct{}
-	closeReason string
 }
 
 func newWSConnection(
@@ -56,21 +48,19 @@ func newWSConnection(
 	ticket *domain.ConnectionTicket,
 	socket *websocket.Conn,
 	ephemeralQueueSize, reliableQueueSize int,
+	metrics *observability.Metrics,
 	now time.Time,
 ) *wsConnection {
 	return &wsConnection{
-		id:           id,
-		sessionID:    ticket.SessionID,
-		userID:       ticket.UserID,
-		noteID:       ticket.NoteID,
-		permission:   ticket.Permission,
-		socket:       socket,
-		ephemeral:    make(map[string]*domain.Envelope, ephemeralQueueSize),
-		maxEphemeral: ephemeralQueueSize,
-		reliable:     make(chan *domain.Envelope, reliableQueueSize),
-		wake:         make(chan struct{}, 1),
-		connectedAt:  now,
-		closed:       make(chan struct{}),
+		outboundQueues: newOutboundQueues(ephemeralQueueSize, reliableQueueSize),
+		id:             id,
+		sessionID:      ticket.SessionID,
+		userID:         ticket.UserID,
+		noteID:         ticket.NoteID,
+		permission:     ticket.Permission,
+		socket:         socket,
+		metrics:        metrics,
+		connectedAt:    now,
 	}
 }
 
@@ -92,86 +82,73 @@ func (c *wsConnection) SetPermission(permission domain.Permission) {
 	c.mu.Unlock()
 }
 
-// SendReliable queues a message that must arrive, refusing when full.
-//
-// Returning an error rather than blocking is deliberate: blocking here would
-// stall whichever goroutine is fanning out to the whole room, letting one slow
-// client freeze everyone else.
+// EnableBinaryFrames is called only after this socket supplied a valid binary
+// preview. It is an opportunistic, backward-compatible capability negotiation:
+// a still-open older browser keeps receiving JSON and remains fully usable.
+func (c *wsConnection) EnableBinaryFrames() {
+	c.mu.Lock()
+	c.binaryFrames = true
+	c.mu.Unlock()
+}
+
+// EnableBinaryAggregates is an explicit client capability. It is separate from
+// ordinary binary support so a Phase-16 browser never receives an unknown
+// aggregate frame during a rolling deployment.
+func (c *wsConnection) EnableBinaryAggregates() {
+	c.mu.Lock()
+	c.aggregateFrames = true
+	c.mu.Unlock()
+}
+
+func (c *wsConnection) supportsBinaryFrames() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.binaryFrames
+}
+
+func (c *wsConnection) supportsBinaryAggregates() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.binaryFrames && c.aggregateFrames
+}
+
 func (c *wsConnection) SendReliable(envelope *domain.Envelope) error {
-	select {
-	case <-c.closed:
-		return nil
-	default:
+	err := c.pushReliable(envelope)
+	if err != nil && c.metrics != nil {
+		c.metrics.ReliableOverflow.Add(1)
 	}
-
-	select {
-	case c.reliable <- envelope:
-		c.signal()
-		return nil
-	default:
-		return errReliableQueueFull
+	if c.metrics != nil {
+		c.metrics.ObserveQueueDepth(c.PendingReliable(), c.PendingEphemeral())
 	}
+	return err
 }
 
-// SendEphemeral queues a droppable frame, replacing any queued frame with the
-// same key.
 func (c *wsConnection) SendEphemeral(envelope *domain.Envelope, coalesceKey string) {
-	select {
-	case <-c.closed:
-		return
-	default:
+	droppedBefore := c.Dropped()
+	c.pushEphemeral(envelope, coalesceKey)
+	if c.metrics != nil {
+		c.metrics.DroppedEphemeral.Add(int64(c.Dropped() - droppedBefore))
+		c.metrics.ObserveQueueDepth(c.PendingReliable(), c.PendingEphemeral())
 	}
-
-	c.ephemeralMu.Lock()
-	if _, exists := c.ephemeral[coalesceKey]; exists {
-		c.dropped++
-	} else {
-		c.ephemeralOrder = append(c.ephemeralOrder, coalesceKey)
-	}
-	c.ephemeral[coalesceKey] = envelope
-
-	// Under sustained pressure shed the oldest stream: an ancient cursor
-	// position is worth less than a current one.
-	for len(c.ephemeralOrder) > c.maxEphemeral {
-		oldest := c.ephemeralOrder[0]
-		c.ephemeralOrder = c.ephemeralOrder[1:]
-		delete(c.ephemeral, oldest)
-		c.dropped++
-	}
-	c.ephemeralMu.Unlock()
-
-	c.signal()
 }
+
+func (c *wsConnection) PendingReliable() int { return c.outboundQueues.PendingReliable() }
 
 func (c *wsConnection) Close(reason string) {
-	c.closeOnce.Do(func() {
-		c.closeReason = reason
-		close(c.closed)
-		// StatusNormalClosure: the peer should reconnect, not treat this as a
-		// protocol failure.
-		_ = c.socket.Close(websocket.StatusNormalClosure, truncateReason(reason))
-	})
-}
-
-func (c *wsConnection) Dropped() uint64 {
-	c.ephemeralMu.Lock()
-	defer c.ephemeralMu.Unlock()
-	return c.dropped
-}
-
-// signal nudges the writer without ever blocking the sender.
-func (c *wsConnection) signal() {
-	select {
-	case c.wake <- struct{}{}:
-	default:
+	alreadyClosed := c.isClosed()
+	c.markClosed()
+	if alreadyClosed {
+		return
 	}
+	// StatusNormalClosure: the peer should reconnect, not treat this as a
+	// protocol failure.
+	_ = c.socket.Close(websocket.StatusNormalClosure, truncateReason(reason))
 }
 
 // writePump is the only goroutine that writes to the socket.
-//
-// Reliable messages drain first: a commit must not wait behind a queue of
-// cursor frames, which are individually worthless by comparison.
 func (c *wsConnection) writePump(ctx context.Context, writeTimeout time.Duration) {
+	ticker := time.NewTicker(ephemeralFlushInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -179,64 +156,96 @@ func (c *wsConnection) writePump(ctx context.Context, writeTimeout time.Duration
 		case <-c.closed:
 			return
 		case <-c.wake:
-			if !c.drain(ctx, writeTimeout) {
+			if !c.drainReliable(ctx, writeTimeout) {
+				return
+			}
+		case <-ticker.C:
+			if !c.drainEphemeral(ctx, writeTimeout) {
 				return
 			}
 		}
 	}
 }
 
-func (c *wsConnection) drain(ctx context.Context, writeTimeout time.Duration) bool {
+// drain empties both queues, reliable first: a commit must not wait behind a
+// queue of cursor frames, which are individually worthless by comparison.
+func (c *wsConnection) drainReliable(ctx context.Context, writeTimeout time.Duration) bool {
 	for {
-		select {
-		case envelope := <-c.reliable:
-			if !c.write(ctx, envelope, writeTimeout) {
+		if envelope := c.takeReliable(); envelope != nil {
+			c.beginReliableWrite()
+			written := c.write(ctx, envelope, writeTimeout)
+			c.endReliableWrite()
+			if !written {
 				return false
 			}
 			continue
-		default:
 		}
 
-		envelope := c.takeEphemeral()
-		if envelope == nil {
-			return true
-		}
-		if !c.write(ctx, envelope, writeTimeout) {
-			return false
-		}
+		return true
 	}
 }
 
-func (c *wsConnection) takeEphemeral() *domain.Envelope {
-	c.ephemeralMu.Lock()
-	defer c.ephemeralMu.Unlock()
-
-	if len(c.ephemeralOrder) == 0 {
-		return nil
+func (c *wsConnection) drainEphemeral(ctx context.Context, writeTimeout time.Duration) bool {
+	for {
+		batch := c.takeEphemeralBatch(maxEphemeralAggregateFrames)
+		if len(batch) == 0 {
+			return true
+		}
+		if len(batch) > 1 && c.supportsBinaryAggregates() {
+			if encoded, ok := codec.EncodeRelayAggregate(batch); ok {
+				if !c.writeRaw(ctx, websocket.MessageBinary, encoded, writeTimeout) {
+					return false
+				}
+				continue
+			}
+		}
+		for _, envelope := range batch {
+			if !c.write(ctx, envelope, writeTimeout) {
+				return false
+			}
+		}
 	}
-	key := c.ephemeralOrder[0]
-	c.ephemeralOrder = c.ephemeralOrder[1:]
-	envelope := c.ephemeral[key]
-	delete(c.ephemeral, key)
-	return envelope
 }
 
 func (c *wsConnection) write(ctx context.Context, envelope *domain.Envelope, timeout time.Duration) bool {
-	encoded, err := json.Marshal(envelope)
-	if err != nil {
+	encoded, messageType := c.wireBytes(envelope)
+	if encoded == nil {
 		// A message we cannot encode is a bug, not a transport failure; drop it
 		// rather than tearing down a healthy connection.
 		return true
 	}
 
+	return c.writeRaw(ctx, messageType, encoded, timeout)
+}
+
+func (c *wsConnection) writeRaw(ctx context.Context, messageType websocket.MessageType, encoded []byte, timeout time.Duration) bool {
 	writeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if err := c.socket.Write(writeCtx, websocket.MessageText, encoded); err != nil {
+	if err := c.socket.Write(writeCtx, messageType, encoded); err != nil {
 		c.Close("write failed")
 		return false
 	}
+	if c.metrics != nil {
+		c.metrics.MessagesOut.Add(1)
+		c.metrics.OutgoingBytes.Add(int64(len(encoded)))
+	}
 	return true
+}
+
+// wireBytes keeps Phase 16's scope tight: only ephemeral events go binary.
+// Reliable/control messages always stay JSON even on a binary-capable socket.
+func (c *wsConnection) wireBytes(envelope *domain.Envelope) ([]byte, websocket.MessageType) {
+	if c.supportsBinaryFrames() && domain.ClassifyEvent(envelope.Event) == domain.ClassEphemeral {
+		if encoded, ok := codec.EncodeRelayFrame(envelope); ok {
+			return encoded, websocket.MessageBinary
+		}
+	}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, websocket.MessageText
+	}
+	return encoded, websocket.MessageText
 }
 
 func truncateReason(reason string) string {

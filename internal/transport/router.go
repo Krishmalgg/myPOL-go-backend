@@ -15,6 +15,9 @@ func NewRouter(h *Handlers, allowedOrigins []string, websocket http.HandlerFunc)
 
 	mux.HandleFunc("GET /healthz", h.Healthz)
 	mux.HandleFunc("GET /readyz", h.Readyz)
+	// Counts only — no session, note or user identifiers, since this endpoint
+	// exists to be scraped.
+	mux.HandleFunc("GET /metrics", h.Metrics().Handler())
 
 	mux.HandleFunc("POST /v1/sessions/bootstrap", h.Bootstrap)
 

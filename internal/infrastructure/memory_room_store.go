@@ -78,6 +78,26 @@ func (s *MemoryRoomStore) Peers(noteID, exceptConnectionID string) []domain.Conn
 	return peers
 }
 
+// ConnectionByID finds one connection within a note's room.
+//
+// Scoped to the note deliberately: a signalling target must be looked up inside
+// the sender's own room, so a connection id learned elsewhere cannot be used to
+// reach into a room the sender is not in.
+func (s *MemoryRoomStore) ConnectionByID(noteID, connectionID string) (domain.Connection, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	connection, ok := s.rooms[noteID][connectionID]
+	return connection, ok
+}
+
+// RoomSize reports how many connections a note's room holds.
+func (s *MemoryRoomStore) RoomSize(noteID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.rooms[noteID])
+}
+
 // Members returns every connection in a room, including the caller.
 func (s *MemoryRoomStore) Members(noteID string) []domain.Connection {
 	s.mu.RLock()
@@ -137,4 +157,20 @@ func (s *MemoryRoomStore) ConnectionCount() int {
 		total += len(room)
 	}
 	return total
+}
+
+// AllConnections returns a snapshot across rooms. Shutdown uses this once to
+// notify and close live transports without holding the room lock while a
+// network operation is in progress.
+func (s *MemoryRoomStore) AllConnections() []domain.Connection {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	connections := make([]domain.Connection, 0)
+	for _, room := range s.rooms {
+		for _, connection := range room {
+			connections = append(connections, connection)
+		}
+	}
+	return connections
 }

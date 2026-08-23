@@ -2,7 +2,6 @@ package transport
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 
 	"mypol/go-realtime/internal/application"
 	"mypol/go-realtime/internal/domain"
+	"mypol/go-realtime/internal/observability"
 	"mypol/go-realtime/internal/security"
 )
 
@@ -28,6 +28,9 @@ const (
 type WebSocketDeps struct {
 	Sessions       *application.SessionService
 	Rooms          *application.RoomService
+	Locks          *application.BlockLockService
+	Interest       *application.InterestService
+	Metrics        *observability.Metrics
 	AllowedOrigins []string
 	RateLimits     security.RateLimitSettings
 	EphemeralQueue int
@@ -72,6 +75,15 @@ func ServeWebSocket(deps WebSocketDeps) http.HandlerFunc {
 			http.Error(w, "ticket rejected", http.StatusUnauthorized)
 			return
 		}
+		if deps.Metrics != nil {
+			deps.Metrics.TicketsConsumed.Add(1)
+		}
+		// A signal may arrive between the first readiness check and ticket
+		// redemption. Do not turn that race into a newly admitted live socket.
+		if deps.Health.IsDraining() {
+			http.Error(w, "draining", http.StatusServiceUnavailable)
+			return
+		}
 
 		socket, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			// Origin was already checked above against the configured list.
@@ -97,11 +109,23 @@ func runConnection(
 
 	now := deps.Now()
 	connection := newWSConnection(
-		deps.NewID(), ticket, socket, deps.EphemeralQueue, deps.ReliableQueue, now)
+		deps.NewID(), ticket, socket, deps.EphemeralQueue, deps.ReliableQueue, deps.Metrics, now)
 	limits := security.NewRateLimits(deps.RateLimits, now)
 
 	deps.Rooms.Join(connection)
-	defer deps.Rooms.Leave(connection)
+	if deps.Metrics != nil {
+		deps.Metrics.ActiveConnections.Add(1)
+		deps.Metrics.ActiveRooms.Store(int64(deps.Rooms.RoomCount()))
+	}
+	defer releaseLocksOnDisconnect(deps.Locks, deps.Rooms, deps.Metrics, connection.ID())
+	defer deps.Interest.Remove(connection.ID())
+	defer func() {
+		deps.Rooms.Leave(connection)
+		if deps.Metrics != nil {
+			deps.Metrics.ActiveConnections.Add(-1)
+			deps.Metrics.ActiveRooms.Store(int64(deps.Rooms.RoomCount()))
+		}
+	}()
 	defer connection.Close("handler returned")
 
 	go connection.writePump(ctx, writeTimeout)
@@ -112,7 +136,7 @@ func runConnection(
 		"noteId", connection.NoteID(),
 		"permission", connection.Permission().String())
 
-	readPump(ctx, deps, connection, socket, limits)
+	readPump(ctx, deps, connection, socket, limits, deps.frameDeps())
 
 	deps.Logger.Info("connection closed",
 		"connectionId", connection.ID(),
@@ -126,6 +150,7 @@ func readPump(
 	connection *wsConnection,
 	socket *websocket.Conn,
 	limits *security.RateLimits,
+	frames frameDeps,
 ) {
 	for {
 		// An idle socket is reaped: a client that stops sending — including one
@@ -141,51 +166,6 @@ func readPump(
 			return
 		}
 
-		handleFrame(deps, connection, limits, data)
+		handleClientFrame(frames, connection, limits, data)
 	}
-}
-
-// handleFrame validates one client message and relays it.
-//
-// Order matters: parse, then rate limit, then authorise, then stamp. Rate
-// limiting before permission checks means a client cannot use rejected messages
-// as a free channel to probe what it is allowed to send.
-func handleFrame(
-	deps WebSocketDeps,
-	connection *wsConnection,
-	limits *security.RateLimits,
-	data []byte,
-) {
-	var envelope domain.Envelope
-	if err := json.Unmarshal(data, &envelope); err != nil || envelope.Event == "" {
-		return
-	}
-
-	class := domain.ClassifyEvent(envelope.Event)
-	now := deps.Now()
-
-	if !limits.Allow(class, now) {
-		deps.Logger.Debug("rate limited",
-			"connectionId", connection.ID(), "event", envelope.Event)
-		return
-	}
-
-	if !connection.Permission().MayPublish(envelope.Event) {
-		deps.Logger.Debug("permission denied",
-			"connectionId", connection.ID(),
-			"event", envelope.Event,
-			"permission", connection.Permission().String())
-		return
-	}
-
-	// Identity and channel come from the authenticated connection, never from
-	// the client's own claims — otherwise a client could publish into another
-	// note's room or forge another user's cursor.
-	envelope.Stamp(connection.SessionID(), connection.ID(), connection.UserID(), now.UnixMilli())
-	envelope.Channel = "note:" + connection.NoteID()
-	if envelope.MessageID == "" {
-		envelope.MessageID = deps.NewID()
-	}
-
-	deps.Rooms.Relay(connection, &envelope)
 }

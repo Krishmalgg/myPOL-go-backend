@@ -12,6 +12,7 @@ import (
 	"mypol/go-realtime/internal/application"
 	"mypol/go-realtime/internal/config"
 	"mypol/go-realtime/internal/domain"
+	"mypol/go-realtime/internal/observability"
 	"mypol/go-realtime/internal/security"
 )
 
@@ -47,6 +48,14 @@ type BootstrapResponse struct {
 	Permission       string      `json:"permission"`
 	NoteID           string      `json:"noteId"`
 	HeartbeatSeconds int         `json:"heartbeatSeconds"`
+	// Omitted when disabled. Its presence is the frontend's compatibility
+	// handshake: a newer browser remains on JSON against an older Go server.
+	BinaryEphemeralVersion int `json:"binaryEphemeralVersion,omitempty"`
+	// Lease cadence, served rather than hardcoded in the client: the server is
+	// the party that enforces expiry, so it is the party that gets to say how
+	// often a holder must refresh.
+	BlockLockLeaseSeconds int `json:"blockLockLeaseSeconds"`
+	BlockLockRenewSeconds int `json:"blockLockRenewSeconds"`
 }
 
 // ICEServer is the STUN/TURN shape browsers expect. Empty for now: real TURN
@@ -60,12 +69,14 @@ type ICEServer struct {
 
 // Handlers wires HTTP to the application layer.
 type Handlers struct {
-	sessions *application.SessionService
-	rooms    *application.RoomService
-	hmac     *security.HMACValidator
-	cfg      *config.Config
-	health   *Health
-	now      application.Clock
+	sessions  *application.SessionService
+	rooms     *application.RoomService
+	hmac      *security.HMACValidator
+	bootstrap *security.BootstrapLimiter
+	metrics   *observability.Metrics
+	cfg       *config.Config
+	health    *Health
+	now       application.Clock
 }
 
 func NewHandlers(
@@ -83,11 +94,22 @@ func NewHandlers(
 		sessions: sessions,
 		rooms:    rooms,
 		hmac:     hmac,
-		cfg:      cfg,
-		health:   health,
-		now:      now,
+		bootstrap: security.NewBootstrapLimiter(security.BootstrapLimitSettings{
+			PerUserPerMinute: cfg.BootstrapRatePerUserPerMinute,
+			PerUserBurst:     cfg.BootstrapBurstPerUser,
+			PerIPPerMinute:   cfg.BootstrapRatePerIPPerMinute,
+			PerIPBurst:       cfg.BootstrapBurstPerIP,
+		}, now()),
+		metrics: observability.New(),
+		cfg:     cfg,
+		health:  health,
+		now:     now,
 	}
 }
+
+// Metrics exposes the counter set so the router can serve it and the server can
+// record connection lifecycle events against it.
+func (h *Handlers) Metrics() *observability.Metrics { return h.metrics }
 
 // ── health ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +137,16 @@ func (h *Handlers) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := h.now()
+
+	// Checked before the token is parsed, so an unauthenticated flood cannot
+	// make the server do signature verification work.
+	if !h.bootstrap.AllowIP(security.ClientIP(r), now) {
+		h.metrics.BootstrapThrottled.Add(1)
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many requests.")
+		return
+	}
+
 	token := bearerToken(r)
 	if token == "" {
 		writeError(w, http.StatusUnauthorized, "MISSING_TOKEN", "A canvas access token is required.")
@@ -123,24 +155,64 @@ func (h *Handlers) Bootstrap(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.sessions.Bootstrap(token)
 	if err != nil {
+		h.metrics.SessionAuthFailures.Add(1)
 		// Never echo the validation detail: it would tell an attacker which part
 		// of a forged token to fix next.
 		writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "The canvas access token was rejected.")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, BootstrapResponse{
-		SessionID:        result.Session.ID,
-		ConnectionTicket: result.Ticket.Value,
-		TicketExpiresAt:  result.TicketExpiresAt,
-		WebSocketURL:     h.cfg.WebSocketURL,
-		WebTransportURL:  h.cfg.WebTransportURL,
-		ICEServers:       []ICEServer{},
-		MaxWebRTCPeers:   h.cfg.WebRTCMaxPeers,
-		Permission:       result.Session.Permission.String(),
-		NoteID:           result.Session.NoteID,
-		HeartbeatSeconds: int(h.cfg.SessionHeartbeat.Seconds()),
-	})
+	// Only now is the identity trustworthy, so the per-user budget — the limit
+	// that actually matters — is applied against a signed claim rather than a
+	// header anyone could set.
+	if !h.bootstrap.AllowUser(result.Session.UserID, now) {
+		h.metrics.BootstrapThrottled.Add(1)
+		_, _ = h.sessions.RevokeSession(result.Session.ID)
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many session requests.")
+		return
+	}
+
+	h.metrics.TicketsIssued.Add(1)
+
+	response := BootstrapResponse{
+		SessionID:             result.Session.ID,
+		ConnectionTicket:      result.Ticket.Value,
+		TicketExpiresAt:       result.TicketExpiresAt,
+		WebSocketURL:          h.cfg.WebSocketURL,
+		WebTransportURL:       h.cfg.WebTransportURL,
+		ICEServers:            h.iceServers(),
+		MaxWebRTCPeers:        h.cfg.WebRTCMaxPeers,
+		Permission:            result.Session.Permission.String(),
+		NoteID:                result.Session.NoteID,
+		HeartbeatSeconds:      int(h.cfg.SessionHeartbeat.Seconds()),
+		BlockLockLeaseSeconds: int(h.cfg.BlockLockLease.Seconds()),
+		BlockLockRenewSeconds: int(h.cfg.BlockLockRenew.Seconds()),
+	}
+	if h.cfg.EphemeralBinaryEnabled {
+		response.BinaryEphemeralVersion = 2
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// iceServers builds the ICE configuration handed to an authenticated client.
+//
+// Served from here rather than from frontend configuration because TURN
+// credentials are secrets: putting them in NEXT_PUBLIC_* would publish relay
+// access to anyone who opened the bundle.
+func (h *Handlers) iceServers() []ICEServer {
+	servers := make([]ICEServer, 0, 2)
+
+	if len(h.cfg.StunURLs) > 0 {
+		servers = append(servers, ICEServer{URLs: h.cfg.StunURLs})
+	}
+	if len(h.cfg.TurnURLs) > 0 && h.cfg.TurnUsername != "" {
+		servers = append(servers, ICEServer{
+			URLs:       h.cfg.TurnURLs,
+			Username:   h.cfg.TurnUsername,
+			Credential: h.cfg.TurnCredential,
+		})
+	}
+	return servers
 }
 
 // ── internal control ────────────────────────────────────────────────────────

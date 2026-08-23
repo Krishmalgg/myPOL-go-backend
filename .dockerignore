@@ -1,0 +1,9 @@
+.git
+.github
+.qodo
+.vscode
+.env
+.env.*
+keys
+*.pem
+coverage

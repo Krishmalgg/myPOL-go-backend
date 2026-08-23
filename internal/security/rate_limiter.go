@@ -54,6 +54,20 @@ func (b *TokenBucket) Tokens() float64 {
 	return b.tokens
 }
 
+// TokensAt reports the allowance a bucket *would* have at a given time, without
+// consuming one. Reading the raw count instead would understate a bucket that
+// has been idle, since refill only happens when Allow is called.
+func (b *TokenBucket) TokensAt(now time.Time) float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	tokens := b.tokens
+	if elapsed := now.Sub(b.last).Seconds(); elapsed > 0 {
+		tokens = min(b.capacity, tokens+elapsed*b.refill)
+	}
+	return tokens
+}
+
 // RateLimits holds the per-class buckets for one connection.
 //
 // Separate buckets on purpose: a flood of cursor frames must not be able to

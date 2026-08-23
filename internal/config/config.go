@@ -41,8 +41,25 @@ type Config struct {
 
 	WebRTCMaxPeers int
 
+	// ICE configuration is served from the authenticated bootstrap rather than
+	// baked into frontend JavaScript, so TURN credentials are never public.
+	StunURLs       []string
+	TurnURLs       []string
+	TurnUsername   string
+	TurnCredential string
+
+	// WebTransport runs on its own HTTP/3 listener. Empty disables it, which is
+	// the default: it needs TLS certificates that a plain WebSocket does not.
+	WebTransportAddr string
+	TLSCertFile      string
+	TLSKeyFile       string
+	MaxDatagramBytes int
+
 	EphemeralQueueSize int
 	ReliableQueueSize  int
+	// Advertised at bootstrap. Zero keeps clients on JSON, which makes a
+	// rolling frontend/server deploy safe instead of assuming binary support.
+	EphemeralBinaryEnabled bool
 
 	EphemeralRatePerConnection  float64
 	EphemeralBurstPerConnection float64
@@ -50,6 +67,22 @@ type Config struct {
 	ReliableBurstPerConnection  float64
 	SignalingRatePerConnection  float64
 	SignalingBurstPerConnection float64
+
+	// Bootstrap limits are per authenticated user first, with a deliberately
+	// generous per-IP ceiling: many legitimate users share one NAT address.
+	BootstrapRatePerUserPerMinute float64
+	BootstrapBurstPerUser         float64
+	BootstrapRatePerIPPerMinute   float64
+	BootstrapBurstPerIP           float64
+
+	// Block geometry leases. The renew interval is advisory — the client uses
+	// it to decide how often to refresh — while the lease is what the server
+	// actually enforces. Renewing at well under half the lease means a single
+	// lost renew does not end a gesture in progress.
+	BlockLockLease             time.Duration
+	BlockLockRenew             time.Duration
+	MaxActiveBlockLocksPerSess int
+	BlockLockSweep             time.Duration
 
 	ShutdownGrace time.Duration
 }
@@ -81,8 +114,19 @@ func Load() (*Config, error) {
 
 		WebRTCMaxPeers: integer("WEBRTC_MAX_PEERS", 6),
 
-		EphemeralQueueSize: integer("EPHEMERAL_QUEUE_SIZE", 64),
-		ReliableQueueSize:  integer("RELIABLE_QUEUE_SIZE", 128),
+		StunURLs:       splitAndTrim(env("STUN_URLS", "stun:stun.l.google.com:19302")),
+		TurnURLs:       splitAndTrim(env("TURN_URLS", "")),
+		TurnUsername:   env("TURN_USERNAME", ""),
+		TurnCredential: env("TURN_CREDENTIAL", ""),
+
+		WebTransportAddr: env("WEBTRANSPORT_ADDR", ""),
+		TLSCertFile:      env("TLS_CERT_FILE", ""),
+		TLSKeyFile:       env("TLS_KEY_FILE", ""),
+		MaxDatagramBytes: integer("MAX_DATAGRAM_BYTES", 1100),
+
+		EphemeralQueueSize:     integer("EPHEMERAL_QUEUE_SIZE", 64),
+		ReliableQueueSize:      integer("RELIABLE_QUEUE_SIZE", 128),
+		EphemeralBinaryEnabled: boolean("EPHEMERAL_BINARY_ENABLED", true),
 
 		// Sustained ephemeral rate sits above 120/s deliberately: ULTRA-profile
 		// batching approaches 125 batches per second, so a tighter ceiling would
@@ -93,6 +137,19 @@ func Load() (*Config, error) {
 		ReliableBurstPerConnection:  float64(integer("RELIABLE_BURST_PER_CONNECTION", 120)),
 		SignalingRatePerConnection:  float64(integer("SIGNALING_RATE_PER_CONNECTION", 30)),
 		SignalingBurstPerConnection: float64(integer("SIGNALING_BURST_PER_CONNECTION", 60)),
+
+		BootstrapRatePerUserPerMinute: float64(integer("BOOTSTRAP_RATE_PER_USER_PER_MINUTE", 30)),
+		BootstrapBurstPerUser:         float64(integer("BOOTSTRAP_BURST_PER_USER", 10)),
+		// 600/min, not 10: a campus or office NAT carries hundreds of real users.
+		BootstrapRatePerIPPerMinute: float64(integer("BOOTSTRAP_RATE_PER_IP_PER_MINUTE", 600)),
+		BootstrapBurstPerIP:         float64(integer("BOOTSTRAP_BURST_PER_IP", 100)),
+
+		BlockLockLease:             seconds("BLOCK_LOCK_LEASE_SECONDS", 5),
+		BlockLockRenew:             seconds("BLOCK_LOCK_RENEW_SECONDS", 2),
+		MaxActiveBlockLocksPerSess: integer("MAX_ACTIVE_BLOCK_LOCKS_PER_SESSION", 4),
+		// Swept at half the renew interval so an expired lease is announced
+		// within a frame or two of lapsing, not a second later.
+		BlockLockSweep: time.Second,
 
 		ShutdownGrace: seconds("SHUTDOWN_GRACE_SECONDS", 5),
 	}
@@ -110,6 +167,13 @@ func (c *Config) InternalControlEnabled() bool {
 	return c.InternalHMACCurrentKeyID != "" && c.InternalHMACCurrentSecret != ""
 }
 
+// WebTransportEnabled reports whether HTTP/3 can actually be served. All three
+// pieces are required: without certificates QUIC cannot start at all, so a
+// half-configured deployment must stay on WebSocket rather than fail to boot.
+func (c *Config) WebTransportEnabled() bool {
+	return c.WebTransportAddr != "" && c.TLSCertFile != "" && c.TLSKeyFile != ""
+}
+
 func env(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok && strings.TrimSpace(value) != "" {
 		return strings.TrimSpace(value)
@@ -123,6 +187,18 @@ func integer(key string, fallback int) int {
 		return fallback
 	}
 	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func boolean(key string, fallback bool) bool {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	value, err := strconv.ParseBool(strings.TrimSpace(raw))
 	if err != nil {
 		return fallback
 	}

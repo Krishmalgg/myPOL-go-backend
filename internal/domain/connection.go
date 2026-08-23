@@ -33,6 +33,11 @@ type Connection interface {
 	// Close ends the connection with a reason for logging.
 	Close(reason string)
 
+	// PendingReliable reports frames accepted by the bounded reliable queue but
+	// not yet handed to the transport writer. It lets a draining server give
+	// final/control traffic a short chance to leave before it closes sessions.
+	PendingReliable() int
+
 	ConnectedAt() time.Time
 }
 

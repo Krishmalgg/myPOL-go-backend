@@ -116,6 +116,68 @@ func (s *SessionService) issueTicket(session *domain.CanvasSession, now time.Tim
 	return ticket, nil
 }
 
+// RefreshSession extends a live session with a newly issued access token,
+// without disturbing the transport carrying it.
+//
+// This is what stops a five-minute token from becoming a five-minute session.
+// The client fetches a fresh token from .NET and sends it over the connection it
+// already holds; the session's expiry moves forward and the socket never closes.
+//
+// The refreshed token must describe the *same* session, user and note — a token
+// for a different note would otherwise silently repoint a live connection at
+// someone else's canvas. Permission may stay the same or be reduced, never
+// escalated: gaining rights is a new session's job, so a stale-but-valid token
+// can never be replayed to climb back up after a demotion.
+func (s *SessionService) RefreshSession(sessionID, token string) (*domain.CanvasSession, error) {
+	claims, err := s.validator.Validate(token)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSessionRejected, err)
+	}
+
+	session, ok := s.sessions.Get(sessionID)
+	if !ok {
+		return nil, domain.ErrSessionNotFound
+	}
+
+	if claims.SessionID != session.ID ||
+		claims.UserID != session.UserID ||
+		claims.NoteID != session.NoteID {
+		return nil, fmt.Errorf("%w: token does not match this session", ErrSessionRejected)
+	}
+
+	permission := session.Permission
+	if permissionRank(claims.Permission) < permissionRank(permission) {
+		permission = claims.Permission
+	}
+
+	session.Permission = permission
+	session.TokenJTI = claims.TokenID
+	session.ExpiresAt = claims.ExpiresAt
+	session.Touch(s.now())
+
+	if err := s.sessions.Save(session); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// permissionRank orders the vocabulary so a refresh can tell a demotion from an
+// escalation attempt.
+func permissionRank(permission domain.Permission) int {
+	switch permission {
+	case domain.PermissionOwner:
+		return 4
+	case domain.PermissionEdit:
+		return 3
+	case domain.PermissionComment:
+		return 2
+	case domain.PermissionView:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // ConsumeTicket redeems a connection ticket. Single-use is enforced by the
 // store, not here, because two connections can race for the same value.
 func (s *SessionService) ConsumeTicket(value string) (*domain.ConnectionTicket, error) {

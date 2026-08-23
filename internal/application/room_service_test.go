@@ -74,6 +74,8 @@ func (c *fakeConnection) Close(reason string) {
 	c.mu.Unlock()
 }
 
+func (c *fakeConnection) PendingReliable() int { return 0 }
+
 func (c *fakeConnection) isClosed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -177,6 +179,67 @@ func TestLeaveAnnouncesDeparture(t *testing.T) {
 	}
 	if store.ConnectionCount() != 1 {
 		t.Errorf("connection count = %d, want 1", store.ConnectionCount())
+	}
+}
+
+func TestDrainNotifiesConnectionsAndSuppressesPresenceLeaves(t *testing.T) {
+	rooms, _ := newRooms()
+	first := newFakeConnection("c1", "s1", "u1", "note-1")
+	second := newFakeConnection("c2", "s2", "u2", "note-1")
+	rooms.Join(first)
+	rooms.Join(second)
+
+	if got := rooms.BeginDrain(5 * time.Second); got != 2 {
+		t.Fatalf("drained connections = %d, want 2", got)
+	}
+	if got := first.events(true); got[len(got)-1] != "server.draining" {
+		t.Fatalf("first events = %v, want server.draining last", got)
+	}
+	if got := second.events(true); got[len(got)-1] != "server.draining" {
+		t.Fatalf("second events = %v, want server.draining last", got)
+	}
+
+	before := len(first.events(true))
+	rooms.Leave(second)
+	if got := len(first.events(true)); got != before {
+		t.Fatalf("presence.left during drain added an event: before=%d after=%d", before, got)
+	}
+}
+
+func TestDrainRejectsFurtherRelayAndClosesAllConnections(t *testing.T) {
+	rooms, _ := newRooms()
+	first := newFakeConnection("c1", "s1", "u1", "note-1")
+	second := newFakeConnection("c2", "s2", "u2", "note-1")
+	rooms.Join(first)
+	rooms.Join(second)
+	rooms.BeginDrain(time.Second)
+
+	before := len(second.events(true))
+	rooms.Relay(first, envelopeFor("ink.commit", `{"strokeId":"stroke-1"}`))
+	if got := len(second.events(true)); got != before {
+		t.Fatalf("relay during drain added an event: before=%d after=%d", before, got)
+	}
+
+	if got := rooms.CloseAll("server draining"); got != 2 {
+		t.Fatalf("closed = %d, want 2", got)
+	}
+	if !first.isClosed() || !second.isClosed() {
+		t.Fatal("all room connections should close during drain")
+	}
+}
+
+func TestDrainRejectsAConnectionThatRacesAdmission(t *testing.T) {
+	rooms, store := newRooms()
+	rooms.BeginDrain(time.Second)
+	racing := newFakeConnection("late", "s-late", "u-late", "note-1")
+
+	rooms.Join(racing)
+
+	if !racing.isClosed() {
+		t.Fatal("a connection admitted after drain began must close")
+	}
+	if got := store.ConnectionCount(); got != 0 {
+		t.Fatalf("connection count = %d, want 0", got)
 	}
 }
 
@@ -335,5 +398,31 @@ func TestApplyPermissionChangesLiveConnectionsInPlace(t *testing.T) {
 	}
 	if connection.isClosed() {
 		t.Error("a permission change must not close the connection")
+	}
+}
+
+// A client has no other way to learn its own connection id: it is minted at
+// connect time and appears in every grant, presence frame and signalling
+// target. Without it a client cannot tell its own lock grant from a peer's.
+func TestTheRosterTellsAConnectionItsOwnID(t *testing.T) {
+	rooms, _ := newRooms()
+	ana := newFakeConnection("conn-ana", "sess-ana", "user-ana", "note-1")
+
+	rooms.Join(ana)
+
+	var payload struct {
+		You     string `json:"you"`
+		Members []struct {
+			ConnectionID string `json:"connectionId"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(ana.reliable[0].Payload, &payload); err != nil {
+		t.Fatalf("decode roster: %v", err)
+	}
+	if payload.You != "conn-ana" {
+		t.Errorf("you = %q, want conn-ana", payload.You)
+	}
+	if len(payload.Members) != 1 {
+		t.Errorf("members = %d, want the newcomer itself", len(payload.Members))
 	}
 }

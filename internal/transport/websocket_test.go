@@ -28,6 +28,8 @@ type wsHarness struct {
 	keys     *testsupport.KeyPair
 	sessions *application.SessionService
 	rooms    *application.RoomService
+	locks    *application.BlockLockService
+	interest *application.InterestService
 	health   *Health
 }
 
@@ -57,21 +59,35 @@ func newWSHarness(t *testing.T) *wsHarness {
 	}
 
 	rooms := application.NewRoomService(infrastructure.NewMemoryRoomStore(), newID, clock)
+	locks := application.NewBlockLockService(
+		infrastructure.NewMemoryLockStore(),
+		application.BlockLockSettings{Lease: 5 * time.Second, MaxPerSession: 4},
+		clock)
 	health := &Health{}
+
+	interest := application.NewInterestService(infrastructure.NewMemoryInterestIndex())
 
 	cfg := &config.Config{
 		AllowedOrigins:   []string{"http://localhost:3000"},
 		WebSocketURL:     "ws://example/ws",
 		WebRTCMaxPeers:   6,
 		SessionHeartbeat: 15 * time.Second,
+		BlockLockLease:   5 * time.Second,
+		BlockLockRenew:   2 * time.Second,
+
+		MaxActiveBlockLocksPerSess: 4,
 	}
 
 	handlers := NewHandlers(sessions, rooms,
 		security.NewHMACValidator(security.HMACKey{KeyID: "k", Secret: "s"}, security.HMACKey{}, 30*time.Second),
 		cfg, health, clock)
+	rooms.SetInterest(interest, handlers.Metrics())
 
 	wsHandler := ServeWebSocket(WebSocketDeps{
 		Sessions:       sessions,
+		Locks:          locks,
+		Interest:       interest,
+		Metrics:        handlers.Metrics(),
 		Rooms:          rooms,
 		AllowedOrigins: cfg.AllowedOrigins,
 		RateLimits: security.RateLimitSettings{
@@ -93,6 +109,8 @@ func newWSHarness(t *testing.T) *wsHarness {
 		keys:     keys,
 		sessions: sessions,
 		rooms:    rooms,
+		locks:    locks,
+		interest: interest,
 		health:   health,
 	}
 	t.Cleanup(harness.server.Close)
@@ -276,6 +294,81 @@ func TestCursorReachesPeerWithServerStampedIdentity(t *testing.T) {
 	}
 	if envelope.Origin == nil || *envelope.Origin == "" {
 		t.Error("origin should be the sender's connection id")
+	}
+}
+
+// The whole point of Phase 14: a collaborator learns a media block exists
+// before the file behind it has even started uploading, over the realtime
+// path rather than waiting for autosave and the durable event that follows it.
+func TestANewMediaBlockReachesAPeerImmediately(t *testing.T) {
+	h := newWSHarness(t)
+
+	first := h.connect(t, testsupport.ClaimsInput{SessionID: "s1", UserID: "user-1"})
+	readEnvelope(t, first)
+
+	second := h.connect(t, testsupport.ClaimsInput{SessionID: "s2", UserID: "user-2"})
+	readEnvelope(t, second) // roster
+	readEnvelope(t, first)  // presence.joined
+
+	send(t, second, "block.created", `{
+		"blockId": "block-1", "pageId": "page-1", "blockType": "image",
+		"x": 10, "y": 20, "width": 360, "height": 240, "rotation": 0,
+		"content": "{\"type\":\"image\",\"attachmentId\":null,\"status\":\"uploading\"}"
+	}`)
+
+	envelope := readEnvelope(t, first)
+	if envelope.Event != "block.created" {
+		t.Fatalf("event = %q, want block.created", envelope.Event)
+	}
+}
+
+// Loading progress must reach peers too — not only the block's first
+// appearance — so a collaborator's placeholder can move from "uploading" to
+// "ready" without waiting on autosave.
+func TestMediaStatusReachesAPeer(t *testing.T) {
+	h := newWSHarness(t)
+
+	first := h.connect(t, testsupport.ClaimsInput{SessionID: "s1", UserID: "user-1"})
+	readEnvelope(t, first)
+
+	second := h.connect(t, testsupport.ClaimsInput{SessionID: "s2", UserID: "user-2"})
+	readEnvelope(t, second)
+	readEnvelope(t, first)
+
+	send(t, second, "block.status", `{"blockId":"block-1","status":"ready","attachmentId":"att-1"}`)
+
+	envelope := readEnvelope(t, first)
+	if envelope.Event != "block.status" {
+		t.Fatalf("event = %q, want block.status", envelope.Event)
+	}
+}
+
+// A viewer may watch a media upload happen but must not be able to conjure a
+// block into a canvas it has no write access to — the same rule that already
+// stops a viewer drawing ink or moving a block.
+func TestAViewerCannotAnnounceAMediaBlock(t *testing.T) {
+	h := newWSHarness(t)
+
+	editor := h.connect(t, testsupport.ClaimsInput{SessionID: "s1", Permission: "edit"})
+	readEnvelope(t, editor)
+
+	viewer := h.connect(t, testsupport.ClaimsInput{SessionID: "s2", Permission: "view"})
+	readEnvelope(t, viewer)
+	readEnvelope(t, editor)
+
+	// Dropped by the server...
+	send(t, viewer, "block.created", `{
+		"blockId": "block-1", "pageId": "page-1", "blockType": "image",
+		"x": 0, "y": 0, "width": 100, "height": 100, "rotation": 0,
+		"content": "{}"
+	}`)
+	// ...but a cursor still gets through, so the next frame the editor sees is
+	// the cursor rather than the forged block.
+	send(t, viewer, "cursor.moved", `{"pageId":"p","x":1,"y":2}`)
+
+	envelope := readEnvelope(t, editor)
+	if envelope.Event != "cursor.moved" {
+		t.Fatalf("event = %q — a viewer's block.created must not be relayed", envelope.Event)
 	}
 }
 

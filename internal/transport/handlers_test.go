@@ -61,10 +61,11 @@ func newHarness(t *testing.T, withHMAC bool) *harness {
 	hmac := security.NewHMACValidator(current, security.HMACKey{}, 30*time.Second)
 
 	cfg := &config.Config{
-		AllowedOrigins:   []string{"http://localhost:3000"},
-		WebSocketURL:     "wss://realtime.example/ws",
-		WebRTCMaxPeers:   6,
-		SessionHeartbeat: 15 * time.Second,
+		AllowedOrigins:         []string{"http://localhost:3000"},
+		WebSocketURL:           "wss://realtime.example/ws",
+		WebRTCMaxPeers:         6,
+		SessionHeartbeat:       15 * time.Second,
+		EphemeralBinaryEnabled: true,
 	}
 
 	rooms := application.NewRoomService(
@@ -180,6 +181,9 @@ func TestBootstrapReturnsTheFullClientContract(t *testing.T) {
 	if body.MaxWebRTCPeers != 6 {
 		t.Errorf("maxWebRtcPeers = %d, want 6", body.MaxWebRTCPeers)
 	}
+	if body.BinaryEphemeralVersion != 2 {
+		t.Errorf("binaryEphemeralVersion = %d, want 2", body.BinaryEphemeralVersion)
+	}
 	if body.ICEServers == nil {
 		t.Error("iceServers should be present, even when empty")
 	}
@@ -201,6 +205,27 @@ func TestBootstrapOmitsWebTransportUrlWhenUnconfigured(t *testing.T) {
 	}
 	if _, present := raw["webTransportUrl"]; present {
 		t.Error("webTransportUrl should be omitted when not configured")
+	}
+}
+
+// TURN credentials are secrets. Serving them from the authenticated bootstrap
+// is what keeps them out of the frontend bundle.
+func TestBootstrapServesIceConfiguration(t *testing.T) {
+	h := newHarness(t, true)
+
+	res := h.do(h.bootstrapRequest(t, testsupport.ClaimsInput{}))
+	var body BootstrapResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// The harness configures no ICE servers, so the field must still be present
+	// and empty rather than null — clients iterate it unconditionally.
+	if body.ICEServers == nil {
+		t.Fatal("iceServers must be present even when empty")
+	}
+	if body.MaxWebRTCPeers != 6 {
+		t.Errorf("maxWebRtcPeers = %d, want 6", body.MaxWebRTCPeers)
 	}
 }
 

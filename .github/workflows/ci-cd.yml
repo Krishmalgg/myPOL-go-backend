@@ -1,0 +1,65 @@
+name: Go Realtime CI/CD
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/krishmalgg/mypol-go-realtime
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: GOFLAGS=-buildvcs=false go test ./...
+      - run: GOFLAGS=-buildvcs=false go vet ./...
+
+  publish:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+  deploy:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    steps:
+      - name: Deploy container to Oracle VM
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          script: |
+            echo '${{ secrets.GHCR_READ_TOKEN }}' | docker login ghcr.io -u 'krishmalgg' --password-stdin
+            docker network inspect mypol-internal >/dev/null 2>&1 || docker network create mypol-internal
+            docker pull ${{ env.IMAGE }}:${{ github.sha }}
+            docker rm -f mypol-go-realtime 2>/dev/null || true
+            docker run -d --name mypol-go-realtime --restart unless-stopped --network mypol-internal -p 127.0.0.1:8081:8080 -p 8443:8443/udp --env-file /opt/mypol/realtime.env -v /opt/mypol/secrets:/run/secrets:ro ${{ env.IMAGE }}:${{ github.sha }}
