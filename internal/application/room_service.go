@@ -198,7 +198,8 @@ func (s *RoomService) Relay(sender domain.Connection, envelope *domain.Envelope)
 	sent := 0
 	for _, peer := range peers {
 		if class == domain.ClassEphemeral {
-			if !s.interest.Interested(peer.ID(), location) {
+			if !s.interest.Interested(peer.ID(), location) ||
+				!s.interest.AllowsPreview(peer.ID(), envelope.Event) {
 				continue
 			}
 			peer.SendEphemeral(envelope, coalesceKey(sender.ID(), envelope))

@@ -34,6 +34,42 @@ type Interest struct {
 	Y      float64
 	Width  float64
 	Height float64
+
+	// Preview is a recipient-owned bandwidth preference for droppable visual
+	// streams. Nil preserves compatibility with older clients: they receive
+	// every preview just as they did before preferences were introduced.
+	Preview *PreviewPreferences
+}
+
+// PreviewPreferences applies only to ephemeral display traffic. It can never
+// hide a durable commit, a lock, auth, presence, or signalling frame.
+type PreviewPreferences struct {
+	Transform bool
+	Ink       bool
+	Cursor    bool
+	Laser     bool
+}
+
+// AllowsPreview answers whether this recipient elected to receive an
+// ephemeral event. Unknown event names deliberately remain allowed: a newer
+// client must not go visually silent because an older server has not learned a
+// new preview type yet.
+func (i Interest) AllowsPreview(event string) bool {
+	if i.Preview == nil {
+		return true
+	}
+	switch event {
+	case "block.transform.preview":
+		return i.Preview.Transform
+	case "ink.started", "ink.points", "ink.ended":
+		return i.Preview.Ink
+	case "cursor.moved":
+		return i.Preview.Cursor
+	case "laser.moved":
+		return i.Preview.Laser
+	default:
+		return true
+	}
 }
 
 // Cells returns the grid cells this interest's rectangle overlaps, expanded by
@@ -140,6 +176,11 @@ type InterestIndex interface {
 	// a viewport must not have its traffic silently dropped, or the room would
 	// look broken during the first second after every join.
 	Interested(connectionID string, location EventLocation) bool
+
+	// AllowsPreview is a second, recipient-owned filter applied only after
+	// spatial interest. A connection without an interest report remains fully
+	// allowed for backwards-compatible startup behaviour.
+	AllowsPreview(connectionID, event string) bool
 
 	// RemoveNote drops every connection's interest for a note, once its room
 	// has emptied — nothing keeps caring about page 3 of a canvas nobody has

@@ -115,3 +115,43 @@ func TestCountReflectsTrackedConnections(t *testing.T) {
 		t.Errorf("Count() = %d, want 1", service.Count())
 	}
 }
+
+func TestPreviewPreferencesOnlyFilterTheChosenEphemeralStream(t *testing.T) {
+	service := newInterest()
+	connection := newFakeConnection("conn-1", "sess-1", "user-1", "note-1")
+
+	service.Update(connection, json.RawMessage(`{
+		"pageId":"page-1", "x":0, "y":0, "width":100, "height":100,
+		"preview":{"transform":false,"ink":true,"cursor":false,"laser":true}
+	}`))
+
+	if service.AllowsPreview(connection.ID(), "block.transform.preview") {
+		t.Error("transform preview should be disabled for this recipient")
+	}
+	if service.AllowsPreview(connection.ID(), "cursor.moved") {
+		t.Error("cursor preview should be disabled for this recipient")
+	}
+	if !service.AllowsPreview(connection.ID(), "ink.points") {
+		t.Error("ink preview should remain enabled")
+	}
+	if !service.AllowsPreview(connection.ID(), "block.transform.commit") {
+		t.Error("unknown and durable events must never be filtered by this preference")
+	}
+}
+
+func TestPartialPreviewPreferencesDefaultMissingStreamsToEnabled(t *testing.T) {
+	service := newInterest()
+	connection := newFakeConnection("conn-1", "sess-1", "user-1", "note-1")
+
+	service.Update(connection, json.RawMessage(`{
+		"pageId":"page-1", "x":0, "y":0, "width":100, "height":100,
+		"preview":{"cursor":false}
+	}`))
+
+	if service.AllowsPreview(connection.ID(), "cursor.moved") {
+		t.Error("explicit false should remain false")
+	}
+	if !service.AllowsPreview(connection.ID(), "ink.points") {
+		t.Error("omitted preview fields should stay enabled for compatibility")
+	}
+}

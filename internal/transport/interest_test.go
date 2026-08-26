@@ -97,6 +97,36 @@ func TestInterestUpdateIsNeverRelayed(t *testing.T) {
 	}
 }
 
+// Preview preferences are recipient-owned and apply only to disposable visual
+// frames. A user who elects to save data must still receive durable canvas
+// state, otherwise disabling previews could leave their document incorrect.
+func TestPreviewPreferenceOverTheWireFiltersCursorButNotReliableCommit(t *testing.T) {
+	h := newWSHarness(t)
+
+	viewer := h.connect(t, testsupport.ClaimsInput{SessionID: "viewer"})
+	readEnvelope(t, viewer)
+
+	sender := h.connect(t, testsupport.ClaimsInput{SessionID: "sender"})
+	readEnvelope(t, sender)
+	readEnvelope(t, viewer)
+
+	send(t, viewer, application.EventInterestUpdate, `{
+		"pageId":"page-1", "x":0, "y":0, "width":1200, "height":900,
+		"preview":{"cursor":false,"ink":true,"transform":true,"laser":true}
+	}`)
+	waitForCondition(t, func() bool { return h.interest.Count() == 1 })
+
+	// The cursor is intentionally filtered. The following commit is reliable,
+	// so it is the first frame the viewer must receive.
+	send(t, sender, "cursor.moved", `{"pageId":"page-1","x":10,"y":10}`)
+	send(t, sender, "ink.commit", `{"pageId":"page-1","strokeId":"stroke-1"}`)
+
+	envelope := readUntil(t, viewer, "ink.commit")
+	if envelope.Event != "ink.commit" {
+		t.Fatalf("event = %q, want reliable ink.commit", envelope.Event)
+	}
+}
+
 // A viewer may report its own interest — reading a canvas is not restricted
 // to editors, and interest filtering exists to help every participant, not
 // only those who may draw.

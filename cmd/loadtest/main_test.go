@@ -78,6 +78,47 @@ func TestMultiPageEvenlyDistributesTwoPageLoads(t *testing.T) {
 	}
 }
 
+func TestPreviewOffRatioIsSpreadAcrossDrawersAndViewers(t *testing.T) {
+	assignments := makeAssignments(options{
+		scenario:        "multi-page",
+		connections:     200,
+		canvases:        1,
+		pages:           2,
+		activeDrawers:   40,
+		previewOffRatio: .5,
+	})
+
+	activeOff, activeOn, viewerOff, viewerOn := 0, 0, 0, 0
+	perPage := map[string]struct{ off, on int }{}
+	for _, user := range assignments {
+		counts := perPage[user.pageID]
+		if user.previewOff {
+			counts.off++
+		} else {
+			counts.on++
+		}
+		perPage[user.pageID] = counts
+		switch {
+		case user.active && user.previewOff:
+			activeOff++
+		case user.active:
+			activeOn++
+		case user.previewOff:
+			viewerOff++
+		default:
+			viewerOn++
+		}
+	}
+	if activeOff != 20 || activeOn != 20 || viewerOff != 80 || viewerOn != 80 {
+		t.Fatalf("unexpected Preview-off distribution: active off/on=%d/%d viewers off/on=%d/%d", activeOff, activeOn, viewerOff, viewerOn)
+	}
+	for pageID, counts := range perPage {
+		if counts.off != 50 || counts.on != 50 {
+			t.Fatalf("%s Preview-off distribution = off/on %d/%d, want 50/50", pageID, counts.off, counts.on)
+		}
+	}
+}
+
 func TestPercentileUsesSortedSamples(t *testing.T) {
 	values := []float64{1, 2, 3, 4, 5}
 	if got := percentile(values, .50); got != 3 {

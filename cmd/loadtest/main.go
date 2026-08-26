@@ -43,7 +43,8 @@ type options struct {
 	connections                                   int
 	duration, commitEvery, connectRamp            time.Duration
 	drainGrace                                    time.Duration
-	previewRate, activeRatio                      float64
+	interestSettle                                time.Duration
+	previewRate, activeRatio, previewOffRatio     float64
 	activeDrawers, canvases, pages                int
 	insecureTLS                                   bool
 	report                                        string
@@ -62,6 +63,7 @@ type assignment struct {
 	userID, noteID, pageID string
 	x, y                   float64
 	active                 bool
+	previewOff             bool
 }
 
 type inboundFrame struct {
@@ -239,6 +241,7 @@ type virtualUser struct {
 	conn       loadConnection
 	cleanup    func()
 	seq        atomic.Uint64
+	readOnce   sync.Once
 }
 
 type report struct {
@@ -255,6 +258,7 @@ type runReport struct {
 	Connections                            int
 	Duration                               string
 	PreviewRate                            float64
+	PreviewOffRatio                        float64
 	ActiveRatio                            float64
 	ActiveDrawers, Canvases, Pages         int
 }
@@ -315,6 +319,12 @@ func run() error {
 			}
 			users[index] = user
 			state.opened.Add(1)
+			// A real browser consumes its roster and every subsequent presence
+			// frame while other collaborators join. Leaving the reader idle until
+			// the whole ramp finishes turns a 200-user test into a synthetic
+			// reliable-queue-overflow test, and can close early connections before
+			// their preview preference has a chance to affect routing.
+			user.startReader(ctx, state)
 		}(i)
 		if opts.connectRamp > 0 {
 			time.Sleep(opts.connectRamp)
@@ -332,6 +342,11 @@ func run() error {
 	state.assignments = connectedAssignments
 	if len(opened) == 0 {
 		return errors.New("no virtual users connected; check key, server address, and bootstrap limits")
+	}
+	// All readers are already active during the join ramp. Give the relay a
+	// short window to apply every interest.update before measuring previews.
+	if opts.interestSettle > 0 {
+		time.Sleep(opts.interestSettle)
 	}
 
 	start := time.Now()
@@ -375,12 +390,14 @@ func parseOptions() options {
 	flag.DurationVar(&o.duration, "duration", 15*time.Second, "measurement duration")
 	flag.Float64Var(&o.previewRate, "preview-rate", 30, "previews per active drawer per second")
 	flag.Float64Var(&o.activeRatio, "active-ratio", -1, "active ratio; -1 uses scenario default")
+	flag.Float64Var(&o.previewOffRatio, "preview-off-ratio", 0, "fraction of users simulating Preview off (0..1)")
 	flag.IntVar(&o.activeDrawers, "active-drawers", -1, "active drawer count; -1 uses ratio")
 	flag.IntVar(&o.canvases, "canvases", 10, "note rooms for distributed scenario")
 	flag.IntVar(&o.pages, "pages", 8, "logical pages")
 	flag.DurationVar(&o.commitEvery, "commit-every", 3*time.Second, "reliable ink.commit interval; 0 disables")
 	flag.DurationVar(&o.drainGrace, "drain-grace", 5*time.Second, "reliable delivery drain after preview generation stops")
 	flag.DurationVar(&o.connectRamp, "connect-ramp", 0, "delay between connection starts")
+	flag.DurationVar(&o.interestSettle, "interest-settle", time.Second, "time to drain join frames and apply viewport interest before measurement")
 	flag.BoolVar(&o.insecureTLS, "insecure-tls", true, "skip TLS verification for local WebTransport")
 	flag.StringVar(&o.report, "report", "", "markdown output path; JSON is written beside it")
 	flag.Parse()
@@ -391,7 +408,7 @@ func validateOptions(o options) error {
 	if o.connections < 1 || o.connections > 10_000 {
 		return errors.New("connections must be between 1 and 10000")
 	}
-	if o.duration <= 0 || o.drainGrace < 0 || o.previewRate < 0 || o.canvases < 1 || o.pages < 1 {
+	if o.duration <= 0 || o.drainGrace < 0 || o.interestSettle < 0 || o.previewRate < 0 || o.canvases < 1 || o.pages < 1 {
 		return errors.New("duration, canvases, pages, and preview-rate must be positive")
 	}
 	if o.activeRatio < -1 || o.activeRatio > 1 {
@@ -399,6 +416,9 @@ func validateOptions(o options) error {
 	}
 	if o.activeDrawers < -1 || o.activeDrawers > o.connections {
 		return errors.New("active-drawers must be -1 or within connections")
+	}
+	if o.previewOffRatio < 0 || o.previewOffRatio > 1 {
+		return errors.New("preview-off-ratio must be between 0 and 1")
 	}
 	if o.transport != "websocket" && o.transport != "webtransport" {
 		return errors.New("transport must be websocket or webtransport; WebRTC requires a browser ICE run")
@@ -448,7 +468,14 @@ func makeAssignments(o options) []assignment {
 		if o.scenario == "mostly-viewing" {
 			page = 0
 		}
-		a[i] = assignment{userID: fmt.Sprintf("bench-user-%06d", i), noteID: fmt.Sprintf("bench-note-%03d", note), pageID: fmt.Sprintf("bench-page-%03d", page), x: x, y: y, active: i < active}
+		// Interleave Preview-off users by page cohort rather than raw connection
+		// number. `page = i % pages` has the same alternating pattern as a 50%
+		// raw-number split, which would accidentally put every Preview-off user
+		// on one page and every realtime user on the other. The cohort keeps each
+		// page representative of the configured policy mix.
+		cohort := i / max(1, o.pages)
+		previewOff := int(float64(cohort+1)*o.previewOffRatio) > int(float64(cohort)*o.previewOffRatio)
+		a[i] = assignment{userID: fmt.Sprintf("bench-user-%06d", i), noteID: fmt.Sprintf("bench-note-%03d", note), pageID: fmt.Sprintf("bench-page-%03d", page), x: x, y: y, active: i < active, previewOff: previewOff}
 	}
 	return a
 }
@@ -537,7 +564,20 @@ func openVirtualUser(ctx context.Context, o options, a assignment, key *ecdsa.Pr
 			return nil, err
 		}
 	}
-	if _, err = u.sendRaw(ctx, "interest.update", map[string]any{"pageId": a.pageID, "x": a.x - 600, "y": a.y - 450, "width": 1200, "height": 900, "zoom": 1}, false, false, nil); err != nil {
+	if _, err = u.sendRaw(ctx, "interest.update", map[string]any{
+		"pageId": a.pageID,
+		"x":      a.x - 600,
+		"y":      a.y - 450,
+		"width":  1200,
+		"height": 900,
+		"zoom":   1,
+		"preview": map[string]bool{
+			"transform": !a.previewOff,
+			"ink":       !a.previewOff,
+			"cursor":    !a.previewOff,
+			"laser":     !a.previewOff,
+		},
+	}, false, false, nil); err != nil {
 		_ = u.close()
 		return nil, err
 	}
@@ -661,21 +701,25 @@ func (u *virtualUser) sendCommit(ctx context.Context, state *runState, index int
 }
 
 func (u *virtualUser) run(ctx context.Context, state *runState, start time.Time) {
-	readDone := make(chan struct{})
-	go func() { defer close(readDone); u.readLoop(ctx, state) }()
-	if !u.assignment.active || state.opts.previewRate <= 0 {
+	u.startReader(ctx, state)
+	if !u.assignment.active {
 		select {
 		case <-ctx.Done():
 		case <-state.stopSending:
 		}
 		return
 	}
-	interval := time.Duration(float64(time.Second) / state.opts.previewRate)
-	if interval <= 0 {
-		interval = time.Millisecond
+	var previews *time.Ticker
+	var previewC <-chan time.Time
+	if !u.assignment.previewOff && state.opts.previewRate > 0 {
+		interval := time.Duration(float64(time.Second) / state.opts.previewRate)
+		if interval <= 0 {
+			interval = time.Millisecond
+		}
+		previews = time.NewTicker(interval)
+		previewC = previews.C
+		defer previews.Stop()
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	var commits *time.Ticker
 	var commitC <-chan time.Time
 	if state.opts.commitEvery > 0 {
@@ -690,7 +734,7 @@ func (u *virtualUser) run(ctx context.Context, state *runState, start time.Time)
 			return
 		case <-state.stopSending:
 			return
-		case <-ticker.C:
+		case <-previewC:
 			elapsed := time.Since(start).Seconds()
 			d := 18 * elapsed
 			if err := u.sendPreview(ctx, state, "cursor.moved", map[string]any{"pageId": u.assignment.pageID, "x": u.assignment.x + d, "y": u.assignment.y + d/2}); err != nil {
@@ -701,6 +745,12 @@ func (u *virtualUser) run(ctx context.Context, state *runState, start time.Time)
 			index++
 		}
 	}
+}
+
+func (u *virtualUser) startReader(ctx context.Context, state *runState) {
+	u.readOnce.Do(func() {
+		go u.readLoop(ctx, state)
+	})
 }
 
 func (u *virtualUser) readLoop(ctx context.Context, state *runState) {
@@ -827,7 +877,7 @@ func makeReport(s *runState, start, end time.Time) report {
 	deltaOut := s.serverAfter.MessagesOut - s.serverBefore.MessagesOut
 	server := serverReport{MetricsBefore: s.serverBefore, MetricsAfter: s.serverAfter, MessagesPerSecond: float64(deltaIn+deltaOut) / seconds, IncomingBytesPerSecond: float64(s.serverAfter.IncomingBytes-s.serverBefore.IncomingBytes) / seconds, OutgoingBytesPerSecond: float64(s.serverAfter.OutgoingBytes-s.serverBefore.OutgoingBytes) / seconds, RecipientsPerEvent: s.serverAfter.InterestRecipientsPerEvent, DroppedEphemeral: s.serverAfter.DroppedEphemeral - s.serverBefore.DroppedEphemeral, ReliableOverflow: s.serverAfter.ReliableOverflow - s.serverBefore.ReliableOverflow, InterestFiltered: s.serverAfter.InterestFiltered - s.serverBefore.InterestFiltered, QueueDepthMax: max64(s.serverAfter.ReliableQueueDepthMax, s.serverAfter.EphemeralQueueDepthMax), MetricsError: s.serverError}
 	notes := []string{"CPU/RAM are not inferred from load-generator counters; use scripts/run-load-test.ps1 or an OS monitor and attach samples.", "Commit correctness measures reliable Go relay delivery to expected connected peers, not .NET/PostgreSQL canonical persistence.", "WebRTC is intentionally not measured by this Go runner; use a real browser ICE/DataChannel run and keep its result separate."}
-	return report{GeneratedAt: end.UTC().Format(time.RFC3339), GoVersion: runtime.Version(), Run: runReport{BaseURL: s.opts.baseURL, Transport: s.opts.transport, Encoding: s.opts.encoding, Scenario: s.opts.scenario, Connections: s.opts.connections, Duration: s.opts.duration.String(), PreviewRate: s.opts.previewRate, ActiveRatio: s.opts.activeRatio, ActiveDrawers: s.opts.activeDrawers, Canvases: s.opts.canvases, Pages: s.opts.pages}, Observed: o, Server: server, Notes: notes}
+	return report{GeneratedAt: end.UTC().Format(time.RFC3339), GoVersion: runtime.Version(), Run: runReport{BaseURL: s.opts.baseURL, Transport: s.opts.transport, Encoding: s.opts.encoding, Scenario: s.opts.scenario, Connections: s.opts.connections, Duration: s.opts.duration.String(), PreviewRate: s.opts.previewRate, PreviewOffRatio: s.opts.previewOffRatio, ActiveRatio: s.opts.activeRatio, ActiveDrawers: s.opts.activeDrawers, Canvases: s.opts.canvases, Pages: s.opts.pages}, Observed: o, Server: server, Notes: notes}
 }
 
 func percentile(values []float64, fraction float64) float64 {
@@ -872,6 +922,7 @@ Go: %s
 | Connections requested/opened | %d / %d |
 | Duration | %s |
 | Preview rate | %.2f/s per active drawer |
+| Preview-off users | %.0f%% |
 
 ## Results
 
@@ -914,7 +965,7 @@ WebRTC small-room results are excluded because a signaling path is not a browser
 
 Raw counters are in the sibling JSON file.
 
-`, r.GeneratedAt, r.GoVersion, r.Run.Transport, r.Run.Encoding, r.Run.Scenario, r.Run.Connections, o.ConnectionsOpened, r.Run.Duration, r.Run.PreviewRate, o.P50PreviewLatencyMs, o.P95PreviewLatencyMs, o.P99PreviewLatencyMs, o.MessagesPerSecond, o.IncomingBytesPerSecond, o.OutgoingBytesPerSecond, o.BytesPerUser, o.PreviewSent, o.PreviewReceived, o.CommitsSent, o.CommitsReceived, o.ExpectedCommitDeliveries, o.FinalCommitDeliveryRate*100, o.ConnectionFailures, o.Reconnects, s.MessagesPerSecond, s.IncomingBytesPerSecond, s.OutgoingBytesPerSecond, s.RecipientsPerEvent, s.InterestFiltered, s.DroppedEphemeral, s.ReliableOverflow, s.QueueDepthMax)
+`, r.GeneratedAt, r.GoVersion, r.Run.Transport, r.Run.Encoding, r.Run.Scenario, r.Run.Connections, o.ConnectionsOpened, r.Run.Duration, r.Run.PreviewRate, r.Run.PreviewOffRatio*100, o.P50PreviewLatencyMs, o.P95PreviewLatencyMs, o.P99PreviewLatencyMs, o.MessagesPerSecond, o.IncomingBytesPerSecond, o.OutgoingBytesPerSecond, o.BytesPerUser, o.PreviewSent, o.PreviewReceived, o.CommitsSent, o.CommitsReceived, o.ExpectedCommitDeliveries, o.FinalCommitDeliveryRate*100, o.ConnectionFailures, o.Reconnects, s.MessagesPerSecond, s.IncomingBytesPerSecond, s.OutgoingBytesPerSecond, s.RecipientsPerEvent, s.InterestFiltered, s.DroppedEphemeral, s.ReliableOverflow, s.QueueDepthMax)
 }
 
 func printSummary(r report) {

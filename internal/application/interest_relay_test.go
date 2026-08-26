@@ -121,6 +121,37 @@ func TestRelayNeverFiltersReliableTrafficByInterest(t *testing.T) {
 	}
 }
 
+func TestRelayHonoursRecipientPreviewPreferencesButNeverSuppressesCommits(t *testing.T) {
+	rooms, interest := newRoomsWithInterest()
+	sender := newFakeConnection("c1", "s1", "u1", "note-1")
+	viewer := newFakeConnection("c2", "s2", "u2", "note-1")
+	rooms.Join(sender)
+	rooms.Join(viewer)
+
+	interest.Update(viewer, mustJSON(t, map[string]any{
+		"pageId": "page-1", "x": 0, "y": 0, "width": 100, "height": 100,
+		"preview": map[string]any{"transform": false, "ink": true, "cursor": true, "laser": true},
+	}))
+
+	rooms.Relay(sender, envelopeFor("block.transform.preview",
+		`{"blockId":"b1","pageId":"page-1","x":10,"y":10,"width":50,"height":50,"rotation":0}`))
+	if len(viewer.events(false)) != 0 {
+		t.Error("a disabled transform preview must not enter the viewer's ephemeral queue")
+	}
+
+	rooms.Relay(sender, envelopeFor("ink.points", `{"strokeId":"s1","pageId":"page-1","points":[{"x":10,"y":10}]}`))
+	if len(viewer.events(false)) != 1 {
+		t.Error("an enabled ink preview should still reach the viewer")
+	}
+
+	before := len(viewer.events(true))
+	rooms.Relay(sender, envelopeFor("block.transform.commit",
+		`{"blockId":"b1","pageId":"page-1","operationId":"op1","baseRevision":1,"x":10,"y":10,"width":50,"height":50,"rotation":0}`))
+	if len(viewer.events(true))-before != 1 {
+		t.Error("reliable transform commit must bypass preview preferences")
+	}
+}
+
 // A connection reported disconnected — via the same cleanup path the
 // transport layer calls on close — must fall back to receiving everything
 // again rather than silently keeping a stale filter forever.

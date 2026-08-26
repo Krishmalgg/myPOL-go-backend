@@ -94,6 +94,20 @@ func (idx *MemoryInterestIndex) Interested(connectionID string, location domain.
 	return present
 }
 
+// AllowsPreview reads the recipient preference without changing the spatial
+// routing guarantee. A newly joined or older client has no index entry and is
+// therefore allowed every preview until it explicitly says otherwise.
+func (idx *MemoryInterestIndex) AllowsPreview(connectionID, event string) bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	interest, ok := idx.byConnection[connectionID]
+	if !ok {
+		return true
+	}
+	return interest.AllowsPreview(event)
+}
+
 func (idx *MemoryInterestIndex) RemoveNote(noteID string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()

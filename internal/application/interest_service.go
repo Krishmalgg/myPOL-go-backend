@@ -14,11 +14,21 @@ const EventInterestUpdate = "interest.update"
 
 // interestUpdatePayload is what the client sends.
 type interestUpdatePayload struct {
-	PageID string  `json:"pageId"`
-	X      float64 `json:"x"`
-	Y      float64 `json:"y"`
-	Width  float64 `json:"width"`
-	Height float64 `json:"height"`
+	PageID  string                     `json:"pageId"`
+	X       float64                    `json:"x"`
+	Y       float64                    `json:"y"`
+	Width   float64                    `json:"width"`
+	Height  float64                    `json:"height"`
+	Preview *previewPreferencesPayload `json:"preview"`
+}
+
+// Pointers distinguish an omitted property from an explicit false. That keeps
+// partially upgraded clients safe: omitted values mean "keep receiving it".
+type previewPreferencesPayload struct {
+	Transform *bool `json:"transform"`
+	Ink       *bool `json:"ink"`
+	Cursor    *bool `json:"cursor"`
+	Laser     *bool `json:"laser"`
 }
 
 // InterestService turns a client's viewport report into the index entry the
@@ -57,12 +67,13 @@ func (s *InterestService) Update(connection domain.Connection, payload json.RawM
 		// could otherwise report interest tagged with a note it has no
 		// session for, polluting another room's index with entries that can
 		// never match any of that room's connections but still cost memory.
-		NoteID: connection.NoteID(),
-		PageID: parsed.PageID,
-		X:      parsed.X,
-		Y:      parsed.Y,
-		Width:  parsed.Width,
-		Height: parsed.Height,
+		NoteID:  connection.NoteID(),
+		PageID:  parsed.PageID,
+		X:       parsed.X,
+		Y:       parsed.Y,
+		Width:   parsed.Width,
+		Height:  parsed.Height,
+		Preview: parsed.Preview.toDomain(),
 	})
 }
 
@@ -84,9 +95,38 @@ func (s *InterestService) Interested(connectionID string, location domain.EventL
 	return s.index.Interested(connectionID, location)
 }
 
+// AllowsPreview is intentionally separate from Interested: spatial routing
+// answers whether a preview could be visible, whereas this answers whether the
+// recipient currently wants that visual stream at all.
+func (s *InterestService) AllowsPreview(connectionID, event string) bool {
+	if s == nil || s.index == nil {
+		return true
+	}
+	return s.index.AllowsPreview(connectionID, event)
+}
+
 func (s *InterestService) Count() int {
 	if s == nil || s.index == nil {
 		return 0
 	}
 	return s.index.Count()
+}
+
+func (p *previewPreferencesPayload) toDomain() *domain.PreviewPreferences {
+	if p == nil {
+		return nil
+	}
+	return &domain.PreviewPreferences{
+		Transform: boolOr(p.Transform, true),
+		Ink:       boolOr(p.Ink, true),
+		Cursor:    boolOr(p.Cursor, true),
+		Laser:     boolOr(p.Laser, true),
+	}
+}
+
+func boolOr(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
 }
