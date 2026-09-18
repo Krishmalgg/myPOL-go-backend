@@ -2,7 +2,6 @@ package transport
 
 import (
 	"net/http"
-	"slices"
 )
 
 // NewRouter wires the public and internal endpoints.
@@ -50,7 +49,7 @@ func withCORS(next http.Handler, allowedOrigins []string) http.Handler {
 			return
 		}
 
-		if origin != "" && slices.Contains(allowedOrigins, origin) {
+		if originAllowed(allowedOrigins, origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")

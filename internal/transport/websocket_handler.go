@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/coder/websocket"
@@ -57,7 +56,7 @@ func ServeWebSocket(deps WebSocketDeps) http.HandlerFunc {
 		// checked explicitly or any site could open a socket with the user's
 		// ticket. A missing Origin is a non-browser client, which is fine.
 		if origin := r.Header.Get("Origin"); origin != "" &&
-			!slices.Contains(deps.AllowedOrigins, origin) {
+			!originAllowed(deps.AllowedOrigins, origin) {
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
 		}

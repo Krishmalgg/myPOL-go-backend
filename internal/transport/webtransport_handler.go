@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/quic-go/webtransport-go"
@@ -151,7 +150,7 @@ func ServeWebTransport(server *webtransport.Server, deps WebTransportDeps) http.
 		}
 
 		if origin := r.Header.Get("Origin"); origin != "" &&
-			!slices.Contains(deps.AllowedOrigins, origin) {
+			!originAllowed(deps.AllowedOrigins, origin) {
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
 		}

@@ -178,7 +178,7 @@ func (h *Handlers) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		SessionID:             result.Session.ID,
 		ConnectionTicket:      result.Ticket.Value,
 		TicketExpiresAt:       result.TicketExpiresAt,
-		WebSocketURL:          h.cfg.WebSocketURL,
+		WebSocketURL:          h.websocketURL(r),
 		WebTransportURL:       h.cfg.WebTransportURL,
 		ICEServers:            h.iceServers(),
 		MaxWebRTCPeers:        h.cfg.WebRTCMaxPeers,
@@ -192,6 +192,34 @@ func (h *Handlers) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		response.BinaryEphemeralVersion = 2
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// websocketURL is the address the client is told to dial for its socket.
+//
+// A configured WEBSOCKET_URL always wins: behind a proxy or a load balancer the
+// public address cannot be inferred from the request, so a deployment must be
+// able to state it. When it is empty the URL is derived from the request that
+// just arrived, which is what keeps local development working across network
+// changes — the browser is sent back to the exact host it reached, whether that
+// is localhost or whichever LAN address the machine holds today, with no
+// configuration to update.
+//
+// Deriving from the Host header is safe here because the answer only ever goes
+// back to the caller that supplied it: a forged Host redirects that client to
+// itself and nobody else, and the ticket it carries is single-use.
+func (h *Handlers) websocketURL(r *http.Request) string {
+	if h.cfg.WebSocketURL != "" {
+		return h.cfg.WebSocketURL
+	}
+	if r == nil || r.Host == "" {
+		return ""
+	}
+
+	scheme := "ws"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "wss"
+	}
+	return scheme + "://" + r.Host + "/ws"
 }
 
 // iceServers builds the ICE configuration handed to an authenticated client.

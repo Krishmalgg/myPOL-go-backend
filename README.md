@@ -51,6 +51,12 @@ hash, so a locally trusted certificate is easier for manual testing.
 export CANVAS_JWT_PUBLIC_KEY_FILE=./keys/canvas-public.pem
 export INTERNAL_HMAC_CURRENT_KEY_ID=hmac-2026-01
 export INTERNAL_HMAC_CURRENT_SECRET=<secret>
+
+# Optional. Both accept the machine's current LAN address without naming it, so
+# joining a different network needs no edit here.
+export ALLOWED_ORIGINS="http://localhost:3000,http://192.168.*.*:3000,http://10.*.*.*:3000"
+# WEBSOCKET_URL left unset: derived from each bootstrap request's Host.
+
 go run ./cmd/server
 ```
 
@@ -84,7 +90,7 @@ openssl ec -in canvas.key -pubout -out canvas-public.pem              # -> Go
 | Variable | Default | Notes |
 |---|---|---|
 | `HTTP_ADDR` | `:8080` | |
-| `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma separated |
+| `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma separated. An entry may contain `*`, which matches any run of characters except `/` — `http://192.168.*.*:3000` covers a development machine whose LAN address changes with the network. Production should list literal origins |
 | `CANVAS_JWT_ISSUER` | `mypol-api` | |
 | `CANVAS_JWT_AUDIENCE` | `canvas-realtime` | |
 | `CANVAS_JWT_PUBLIC_KEY_FILE` | — | **Required**; startup fails without it |
@@ -96,7 +102,7 @@ openssl ec -in canvas.key -pubout -out canvas-public.pem              # -> Go
 | `CONNECTION_TICKET_SWEEP_SECONDS` | `10` | |
 | `SESSION_HEARTBEAT_SECONDS` | `15` | Advertised to clients |
 | `SESSION_IDLE_TIMEOUT_SECONDS` | `45` | |
-| `WEBSOCKET_URL` / `WEBTRANSPORT_URL` | — | Advertised at bootstrap; WT omitted when empty |
+| `WEBSOCKET_URL` / `WEBTRANSPORT_URL` | — | Advertised at bootstrap. An empty `WEBSOCKET_URL` derives the address from the request's own `Host`, which is what lets a development machine change network without reconfiguration; set it explicitly behind a proxy. WT is omitted when empty |
 | `WEBTRANSPORT_ADDR` | — | UDP listener for HTTP/3. Empty disables WebTransport |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | — | Required for WebTransport; QUIC has no plaintext mode |
 | `MAX_DATAGRAM_BYTES` | `1100` | Frames above this fall back to the reliable stream |
