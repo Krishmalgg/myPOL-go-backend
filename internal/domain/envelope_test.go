@@ -129,3 +129,19 @@ func TestStampOverwritesClientClaimedIdentity(t *testing.T) {
 		t.Errorf("SentAt = %d", envelope.SentAt)
 	}
 }
+
+func TestInkPatchRequiresWritePermission(t *testing.T) {
+	if ClassifyEvent("ink.patch") != ClassReliable {
+		t.Fatal("ink patches must be reliable")
+	}
+	for _, value := range []string{"view", "comment"} {
+		permission, _ := ParsePermission(value)
+		if permission.MayPublish("ink.patch") {
+			t.Fatalf("%s may not edit ink", value)
+		}
+	}
+	permission, _ := ParsePermission("edit")
+	if !permission.MayPublish("ink.patch") {
+		t.Fatal("editors must be able to edit ink")
+	}
+}

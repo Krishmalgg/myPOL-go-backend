@@ -128,13 +128,22 @@ func Load() (*Config, error) {
 		ReliableQueueSize:      integer("RELIABLE_QUEUE_SIZE", 128),
 		EphemeralBinaryEnabled: boolean("EPHEMERAL_BINARY_ENABLED", true),
 
-		// Sustained ephemeral rate sits above 120/s deliberately: ULTRA-profile
-		// batching approaches 125 batches per second, so a tighter ceiling would
-		// throttle legitimate drawing.
-		EphemeralRatePerConnection:  float64(integer("EPHEMERAL_RATE_PER_CONNECTION", 160)),
-		EphemeralBurstPerConnection: float64(integer("EPHEMERAL_BURST_PER_CONNECTION", 240)),
-		ReliableRatePerConnection:   float64(integer("RELIABLE_RATE_PER_CONNECTION", 60)),
-		ReliableBurstPerConnection:  float64(integer("RELIABLE_BURST_PER_CONNECTION", 120)),
+		// One connection's ephemeral streams share this bucket, so the ceiling is
+		// the sum of them, not the largest. A single ULTRA-profile drawer emits
+		// ink at 8ms and cursor at 16ms — about 188/s together, and about 313/s
+		// if a transform drag overlaps. The former ceiling of 160/s sat below
+		// even the ordinary drawing case, so the burst drained after a few
+		// seconds of continuous work and previews then vanished mid-stroke with
+		// no error anywhere. Sized above the worst legitimate case; a runaway
+		// client is orders of magnitude beyond this and is still caught.
+		EphemeralRatePerConnection:  float64(integer("EPHEMERAL_RATE_PER_CONNECTION", 360)),
+		EphemeralBurstPerConnection: float64(integer("EPHEMERAL_BURST_PER_CONNECTION", 540)),
+		// Erasing relays `ink.patch` here, coalesced by the client into roughly
+		// 30 frames a second while a rub is in progress. Added to stroke commits,
+		// transform commits and Yjs updates, the old 60/s left no margin on the
+		// one class that may never be dropped.
+		ReliableRatePerConnection:   float64(integer("RELIABLE_RATE_PER_CONNECTION", 120)),
+		ReliableBurstPerConnection:  float64(integer("RELIABLE_BURST_PER_CONNECTION", 240)),
 		SignalingRatePerConnection:  float64(integer("SIGNALING_RATE_PER_CONNECTION", 30)),
 		SignalingBurstPerConnection: float64(integer("SIGNALING_BURST_PER_CONNECTION", 60)),
 

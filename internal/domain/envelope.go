@@ -58,11 +58,12 @@ const (
 )
 
 var ephemeralEvents = map[string]struct{}{
-	"cursor.moved":            {},
-	"laser.moved":             {},
-	"ink.started":             {},
-	"ink.points":              {},
-	"block.transform.preview": {},
+	"cursor.moved":                {},
+	"laser.moved":                 {},
+	"ink.started":                 {},
+	"ink.points":                  {},
+	"block.transform.preview":     {},
+	"selection.transform.preview": {},
 }
 
 var signalingEvents = map[string]struct{}{
@@ -73,6 +74,7 @@ var signalingEvents = map[string]struct{}{
 
 var reliableEvents = map[string]struct{}{
 	"ink.commit":             {},
+	"ink.patch":              {},
 	"ink.ended":              {},
 	"block.transform.commit": {},
 	"block.lock.request":     {},
@@ -131,7 +133,8 @@ func (p Permission) MayPublish(event string) bool {
 		// Never client-relayable, whatever the permission.
 		return false
 	case ClassEphemeral:
-		if event == "ink.started" || event == "ink.points" || event == "block.transform.preview" {
+		if event == "ink.started" || event == "ink.points" ||
+			event == "block.transform.preview" || event == "selection.transform.preview" {
 			return p.CanDraw()
 		}
 		return true
