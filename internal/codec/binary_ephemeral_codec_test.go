@@ -41,7 +41,7 @@ func TestDecodeClientFrameRestoresQuantizedInk(t *testing.T) {
 	if payload.Points[1].X != 504.25 || payload.Points[1].Y != 302.5 {
 		t.Fatalf("second point = %#v", payload.Points[1])
 	}
-	if payload.Points[0].Pressure == nil || *payload.Points[0].Pressure < 0.49 {
+	if payload.Points[0].Pressure == nil || *payload.Points[0].Pressure != 0.5 {
 		t.Fatalf("pressure was not restored: %#v", payload.Points[0])
 	}
 }

@@ -472,6 +472,11 @@ func decodeInk(reader *reader, flags byte) (any, error) {
 				return nil, err
 			}
 			pressure := float64(value) / 255
+			// Preserve PointerEvent's neutral fallback: 128/255 otherwise turns
+			// simulated touch/mouse pressure into physical pen pressure on peers.
+			if value == 128 {
+				pressure = 0.5
+			}
 			points[index].Pressure = &pressure
 		}
 	}
