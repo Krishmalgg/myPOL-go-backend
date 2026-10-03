@@ -9,8 +9,23 @@
 # which keeps them in dotnet user-secrets. They are read from there rather than
 # written here so the two services cannot drift apart, and so no secret lands in
 # this file or in shell history.
+#
+# The port must match NEXT_PUBLIC_CANVAS_REALTIME_PORT in my-app/.env.local.
+# -Port exists for a second, throwaway instance (e.g. verifying a change while
+# the normal one keeps running); the frontend only ever talks to 8081.
+
+param([int]$Port = 8081)
 
 $ErrorActionPreference = "Stop"
+
+# Starting next to another listener fails late and confusingly (Apache already
+# owns 8080 on the main dev machine), so refuse up front and name the owner.
+$listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($listener) {
+    $owner = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+    throw "Port $Port is already in use by '$($owner.ProcessName)' (pid $($listener.OwningProcess)). Stop it first."
+}
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $goRoot = Join-Path $repoRoot "go-realtime"
@@ -24,7 +39,7 @@ if (-not (Test-Path $secretsPath)) {
 }
 $secrets = Get-Content $secretsPath -Raw | ConvertFrom-Json
 
-$env:HTTP_ADDR = ":8081"
+$env:HTTP_ADDR = ":$Port"
 $env:CANVAS_JWT_PUBLIC_KEY_FILE = "./keys/canvas-public.pem"
 
 # Any address in the private IPv4 ranges, on the Next dev-server port. The

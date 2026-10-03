@@ -47,7 +47,29 @@ hash, so a locally trusted certificate is easier for manual testing.
 
 ## Run
 
+For local development on Windows, use `scripts/run-dev.ps1`, or `dev.ps1` in the
+project root to start the API, this relay and the frontend together. It sets
+everything below, reads the shared secrets from the API's user-secrets, and
+listens on **8081**: the port `NEXT_PUBLIC_CANVAS_REALTIME_PORT` in
+`my-app/.env.local` expects.
+
+To run it by hand instead, copy `.env.example` to `.env` (git-ignored), fill in
+the two `INTERNAL_HMAC_CURRENT_*` values from the API's user-secrets, then:
+
 ```bash
+go run ./cmd/server
+```
+
+The server reads `.env` from the working directory and fills in any variable not
+already set, so the environment still wins. Without it, `go run ./cmd/server`
+falls back to `:8080` and to a `localhost`-only origin list, and the frontend
+then silently uses its SignalR fallback instead of this relay. (Bare `go run`
+with no package never works: the entry point is `./cmd/server`.)
+
+Manual equivalent without `.env`:
+
+```bash
+export HTTP_ADDR=:8081
 export CANVAS_JWT_PUBLIC_KEY_FILE=./keys/canvas-public.pem
 export INTERNAL_HMAC_CURRENT_KEY_ID=hmac-2026-01
 export INTERNAL_HMAC_CURRENT_SECRET=<secret>

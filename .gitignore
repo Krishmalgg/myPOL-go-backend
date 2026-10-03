@@ -1,0 +1,2 @@
+# Local settings for a bare `go run ./cmd/server`; holds the shared HMAC secret.
+.env

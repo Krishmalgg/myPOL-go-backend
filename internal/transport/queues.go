@@ -2,8 +2,10 @@ package transport
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"mypol/go-realtime/internal/domain"
 )
@@ -22,6 +24,10 @@ type outboundQueues struct {
 	ephemeralOrder []string
 	maxEphemeral   int
 	dropped        uint64
+	// droppedInk is the subset of dropped that was live ink. A superseded
+	// cursor is the design working; a lost ink frame is a visible gap in
+	// someone's line, so the two must not share one number.
+	droppedInk uint64
 
 	// reliable is bounded and refuses rather than discarding.
 	reliable chan *domain.Envelope
@@ -34,6 +40,34 @@ type outboundQueues struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+	// closeReason is the first reason given, so the disconnect log says why the
+	// connection ended rather than which deferred cleanup ran last.
+	closeReason string
+
+	// lastActivity is when the client last sent anything (unix nanoseconds),
+	// for transports that cannot use one read deadline (WebTransport reads
+	// datagrams and a stream separately). lastTouch throttles session touches.
+	lastActivity atomic.Int64
+	lastTouch    atomic.Int64
+}
+
+// markActivity records that the client sent something.
+func (q *outboundQueues) markActivity(now time.Time) { q.lastActivity.Store(now.UnixNano()) }
+
+// idleFor is how long the client has been silent.
+func (q *outboundQueues) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, q.lastActivity.Load()))
+}
+
+// shouldTouch reports, at most once per interval, that the session's liveness
+// should be recorded. Ink arrives many times a second; the session store only
+// needs to hear about it occasionally.
+func (q *outboundQueues) shouldTouch(now time.Time, interval time.Duration) bool {
+	last := q.lastTouch.Load()
+	if now.UnixNano()-last < int64(interval) {
+		return false
+	}
+	return q.lastTouch.CompareAndSwap(last, now.UnixNano())
 }
 
 func newOutboundQueues(ephemeralSize, reliableSize int) *outboundQueues {
@@ -57,8 +91,23 @@ func (q *outboundQueues) isClosed() bool {
 
 // markClosed is idempotent, so a transport may call it from both its read and
 // write paths without risking a double close.
-func (q *outboundQueues) markClosed() {
-	q.closeOnce.Do(func() { close(q.closed) })
+func (q *outboundQueues) markClosed() { q.markClosedWith("") }
+
+// markClosedWith records the reason only on the first close.
+func (q *outboundQueues) markClosedWith(reason string) {
+	q.closeOnce.Do(func() {
+		q.closeReason = reason
+		close(q.closed)
+	})
+}
+
+// CloseReason is the reason given by whichever path closed the connection
+// first. Read it only after the connection is closed.
+func (q *outboundQueues) CloseReason() string {
+	if !q.isClosed() {
+		return ""
+	}
+	return q.closeReason
 }
 
 // pushReliable queues a message that must arrive.
@@ -88,8 +137,8 @@ func (q *outboundQueues) pushEphemeral(envelope *domain.Envelope, coalesceKey st
 	}
 
 	q.ephemeralMu.Lock()
-	if _, exists := q.ephemeral[coalesceKey]; exists {
-		q.dropped++
+	if existing, exists := q.ephemeral[coalesceKey]; exists {
+		q.countDrop(existing)
 	} else {
 		q.ephemeralOrder = append(q.ephemeralOrder, coalesceKey)
 	}
@@ -100,8 +149,8 @@ func (q *outboundQueues) pushEphemeral(envelope *domain.Envelope, coalesceKey st
 	for len(q.ephemeralOrder) > q.maxEphemeral {
 		oldest := q.ephemeralOrder[0]
 		q.ephemeralOrder = q.ephemeralOrder[1:]
+		q.countDrop(q.ephemeral[oldest])
 		delete(q.ephemeral, oldest)
-		q.dropped++
 	}
 	q.ephemeralMu.Unlock()
 
@@ -180,10 +229,25 @@ func (q *outboundQueues) signal() {
 	}
 }
 
+// countDrop records one discarded frame. Called with ephemeralMu held.
+func (q *outboundQueues) countDrop(envelope *domain.Envelope) {
+	q.dropped++
+	if envelope != nil && strings.HasPrefix(envelope.Event, "ink.") {
+		q.droppedInk++
+	}
+}
+
 // Dropped reports frames discarded by coalescing or shedding — a health signal
 // worth surfacing, since silent loss is the whole point of the ephemeral queue.
 func (q *outboundQueues) Dropped() uint64 {
 	q.ephemeralMu.Lock()
 	defer q.ephemeralMu.Unlock()
 	return q.dropped
+}
+
+// DroppedInk reports the ink frames among Dropped.
+func (q *outboundQueues) DroppedInk() uint64 {
+	q.ephemeralMu.Lock()
+	defer q.ephemeralMu.Unlock()
+	return q.droppedInk
 }

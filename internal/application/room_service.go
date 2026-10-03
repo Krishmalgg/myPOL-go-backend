@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -58,6 +59,9 @@ type RoomService struct {
 	newID     MessageIDFunc
 	now       Clock
 	channelOf func(noteID string) string
+
+	// deltaSeq gives every delta frame its own queue slot; see coalesceKey.
+	deltaSeq atomic.Uint64
 
 	// maxWebRTCPeers caps the room size in which a peer mesh is permitted.
 	// Above it, signalling is refused so clients fall back to the server relay
@@ -198,11 +202,14 @@ func (s *RoomService) Relay(sender domain.Connection, envelope *domain.Envelope)
 	sent := 0
 	for _, peer := range peers {
 		if class == domain.ClassEphemeral {
-			if !s.interest.Interested(peer.ID(), location) ||
+			// Live ink skips spatial filtering. Its continuations carry no page,
+			// so they already reach everyone; filtering only the start by page
+			// left peers holding points for a stroke they never saw begin.
+			if (!isLiveInk(envelope.Event) && !s.interest.Interested(peer.ID(), location)) ||
 				!s.interest.AllowsPreview(peer.ID(), envelope.Event) {
 				continue
 			}
-			peer.SendEphemeral(envelope, coalesceKey(sender.ID(), envelope))
+			peer.SendEphemeral(envelope, s.coalesceKey(sender.ID(), envelope))
 			sent++
 			continue
 		}
@@ -395,8 +402,21 @@ func (s *RoomService) envelope(noteID, event string, payload any) *domain.Envelo
 // coalesceKey groups frames that supersede one another. Two strokes from the
 // same author are independent streams, so the subject id is part of the key —
 // otherwise a second stroke would evict the first mid-draw.
-func coalesceKey(connectionID string, envelope *domain.Envelope) string {
-	return connectionID + "|" + envelope.Event + "|" + subjectID(envelope.Payload)
+//
+// ink.points is a delta, not a snapshot: each batch carries new points, so a
+// newer batch replacing a queued one erases part of the line. Client and relay
+// both run 8ms cadences, so two batches landing in one flush window is routine.
+// Deltas therefore get a unique key and are only ever shed by queue overflow.
+func (s *RoomService) coalesceKey(connectionID string, envelope *domain.Envelope) string {
+	key := connectionID + "|" + envelope.Event + "|" + subjectID(envelope.Payload)
+	if envelope.Event == "ink.points" {
+		return key + "|" + strconv.FormatUint(s.deltaSeq.Add(1), 10)
+	}
+	return key
+}
+
+func isLiveInk(event string) bool {
+	return event == "ink.started" || event == "ink.points"
 }
 
 func subjectID(payload json.RawMessage) string {

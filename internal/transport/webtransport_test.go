@@ -80,7 +80,9 @@ type wtHarness struct {
 	server   *webtransport.Server
 }
 
-func newWTHarness(t *testing.T) *wtHarness {
+func newWTHarness(t *testing.T) *wtHarness { return newWTHarnessWithIdle(t, 5*time.Second) }
+
+func newWTHarnessWithIdle(t *testing.T, idleTimeout time.Duration) *wtHarness {
 	t.Helper()
 
 	keys, err := testsupport.NewKeyPair()
@@ -135,7 +137,7 @@ func newWTHarness(t *testing.T) *wtHarness {
 		EphemeralQueue: 64,
 		ReliableQueue:  128,
 		MaxDatagram:    1100,
-		IdleTimeout:    5 * time.Second,
+		IdleTimeout:    idleTimeout,
 		NewID:          newID,
 		Now:            clock,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),

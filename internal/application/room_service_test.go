@@ -326,6 +326,35 @@ func TestCoalesceKeySeparatesStreams(t *testing.T) {
 	}
 }
 
+// ink.points batches are deltas: coalescing two of the same stroke would erase
+// part of the line, while a cursor must still collapse to its latest position.
+func TestInkPointBatchesNeverCoalesceButCursorsDo(t *testing.T) {
+	rooms, _ := newRooms()
+	sender := newFakeConnection("c1", "s1", "u1", "note-1")
+	peer := newFakeConnection("c2", "s2", "u2", "note-1")
+	rooms.Join(sender)
+	rooms.Join(peer)
+
+	rooms.Relay(sender, envelopeFor("ink.points", `{"strokeId":"stroke-a"}`))
+	rooms.Relay(sender, envelopeFor("ink.points", `{"strokeId":"stroke-a"}`))
+	rooms.Relay(sender, envelopeFor("cursor.moved", `{"pageId":"p1","x":1,"y":1}`))
+	rooms.Relay(sender, envelopeFor("cursor.moved", `{"pageId":"p1","x":2,"y":2}`))
+
+	peer.mu.Lock()
+	keys := append([]string(nil), peer.coalesceKeys...)
+	peer.mu.Unlock()
+
+	if len(keys) != 4 {
+		t.Fatalf("expected 4 keys, got %v", keys)
+	}
+	if keys[0] == keys[1] {
+		t.Errorf("two batches of one stroke shared key %q; the later would erase the earlier", keys[0])
+	}
+	if keys[2] != keys[3] {
+		t.Errorf("cursor frames must share a key so only the latest is sent, got %q and %q", keys[2], keys[3])
+	}
+}
+
 // Reliable state must never be silently dropped; closing is the honest outcome.
 func TestPeerThatCannotAcceptReliableTrafficIsClosed(t *testing.T) {
 	rooms, _ := newRooms()

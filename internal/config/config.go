@@ -88,7 +88,12 @@ type Config struct {
 }
 
 // Load reads configuration from the environment, applying the plan's defaults.
+// A .env file in the working directory fills in any variable not already set.
 func Load() (*Config, error) {
+	if err := loadDotEnv(".env"); err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		HTTPAddr:       env("HTTP_ADDR", ":8080"),
 		AllowedOrigins: splitAndTrim(env("ALLOWED_ORIGINS", "http://localhost:3000")),

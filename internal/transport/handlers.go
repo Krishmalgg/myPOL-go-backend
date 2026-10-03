@@ -188,8 +188,9 @@ func (h *Handlers) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		BlockLockLeaseSeconds: int(h.cfg.BlockLockLease.Seconds()),
 		BlockLockRenewSeconds: int(h.cfg.BlockLockRenew.Seconds()),
 	}
+	// 2: relay aggregates. 3: ink points may carry per-point times (P3.1).
 	if h.cfg.EphemeralBinaryEnabled {
-		response.BinaryEphemeralVersion = 2
+		response.BinaryEphemeralVersion = 3
 	}
 	writeJSON(w, http.StatusOK, response)
 }

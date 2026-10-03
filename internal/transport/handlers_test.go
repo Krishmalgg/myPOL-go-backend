@@ -181,8 +181,8 @@ func TestBootstrapReturnsTheFullClientContract(t *testing.T) {
 	if body.MaxWebRTCPeers != 6 {
 		t.Errorf("maxWebRtcPeers = %d, want 6", body.MaxWebRTCPeers)
 	}
-	if body.BinaryEphemeralVersion != 2 {
-		t.Errorf("binaryEphemeralVersion = %d, want 2", body.BinaryEphemeralVersion)
+	if body.BinaryEphemeralVersion != 3 {
+		t.Errorf("binaryEphemeralVersion = %d, want 3", body.BinaryEphemeralVersion)
 	}
 	if body.ICEServers == nil {
 		t.Error("iceServers should be present, even when empty")

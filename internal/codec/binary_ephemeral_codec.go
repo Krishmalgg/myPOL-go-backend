@@ -26,6 +26,12 @@ const (
 	codeAggregate byte = 0xff
 
 	flagHasPressure byte = 0x01
+	// Per-point time offsets (ms since the stroke started), so a receiver can
+	// replay a stroke at the pace it was drawn (canvas sync plan P3.1). They
+	// follow the points as their own section, so a decoder that predates them
+	// reads the points unchanged and never reaches these bytes. Browsers send
+	// it only when the bootstrap advertises binaryEphemeralVersion >= 3.
+	flagHasTime byte = 0x02
 	// Set only on Go -> browser frames. Its variable-length trailer carries
 	// server-stamped identity required by the recipient's dedupe and sequence
 	// tracking. Browser -> Go frames never carry it.
@@ -47,6 +53,8 @@ type inkPoint struct {
 	X        float64  `json:"x"`
 	Y        float64  `json:"y"`
 	Pressure *float64 `json:"pressure,omitempty"`
+	// T is milliseconds since the stroke started.
+	T *uint32 `json:"t,omitempty"`
 }
 
 type inkPayload struct {
@@ -136,7 +144,7 @@ func DecodeClientFrame(data []byte) (*domain.Envelope, error) {
 
 	switch h.code {
 	case codeInk:
-		if h.flags&^flagHasPressure != 0 {
+		if h.flags&^(flagHasPressure|flagHasTime) != 0 {
 			return nil, errMalformedBinaryFrame
 		}
 		event = "ink.points"
@@ -418,6 +426,16 @@ func encodeInk(writer *writer, payload inkPayload) error {
 	if hasPressure {
 		writer.buf[3] |= flagHasPressure
 	}
+	hasTime := len(payload.Points) > 0
+	for _, point := range payload.Points {
+		if point.T == nil {
+			hasTime = false
+			break
+		}
+	}
+	if hasTime {
+		writer.buf[3] |= flagHasTime
+	}
 
 	writer.string(payload.StrokeID)
 	writer.varint(uint32(len(payload.Points)))
@@ -436,6 +454,19 @@ func encodeInk(writer *writer, payload inkPayload) error {
 		previousX, previousY = x, y
 		if hasPressure {
 			writer.u8(pressureByte(*point.Pressure))
+		}
+	}
+	if hasTime {
+		// The first time is absolute, the rest are deltas; a time that runs
+		// backwards is written as no time at all rather than as a huge number.
+		var previous uint32
+		for _, point := range payload.Points {
+			delta := uint32(0)
+			if *point.T > previous {
+				delta = *point.T - previous
+				previous = *point.T
+			}
+			writer.varint(delta)
 		}
 	}
 	return nil
@@ -478,6 +509,18 @@ func decodeInk(reader *reader, flags byte) (any, error) {
 				pressure = 0.5
 			}
 			points[index].Pressure = &pressure
+		}
+	}
+	if flags&flagHasTime != 0 {
+		var t uint32
+		for index := range points {
+			delta, err := reader.varint()
+			if err != nil {
+				return nil, err
+			}
+			t += delta
+			value := t
+			points[index].T = &value
 		}
 	}
 	return inkPayload{StrokeID: strokeID, Points: points}, nil

@@ -138,8 +138,8 @@ func runConnection(
 	readPump(ctx, deps, connection, socket, limits, deps.frameDeps())
 
 	deps.Logger.Info("connection closed",
-		"connectionId", connection.ID(),
-		"droppedFrames", connection.Dropped())
+		append(recordClose(deps.Metrics, connection, "websocket", connection.connectedAt, deps.Now()),
+			"droppedFrames", connection.Dropped())...)
 }
 
 // readPump consumes client frames until the socket closes.
@@ -159,8 +159,10 @@ func readPump(
 		cancel()
 
 		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				connection.Close("read ended")
+			if errors.Is(err, context.Canceled) {
+				connection.Close("server shutdown")
+			} else {
+				connection.Close(wsReadEndReason(err))
 			}
 			return
 		}

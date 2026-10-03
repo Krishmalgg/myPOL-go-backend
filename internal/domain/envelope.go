@@ -83,6 +83,7 @@ var reliableEvents = map[string]struct{}{
 	"block.created":          {},
 	"block.status":           {},
 	"auth.refresh":           {},
+	"heartbeat":              {},
 	"server.draining":        {},
 	"interest.update":        {},
 	"yjs.update":             {},

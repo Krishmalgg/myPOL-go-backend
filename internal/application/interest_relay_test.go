@@ -121,6 +121,32 @@ func TestRelayNeverFiltersReliableTrafficByInterest(t *testing.T) {
 	}
 }
 
+// A stroke's continuations carry no page and so reach everyone; its start must
+// too, or the peer holds points for a stroke it never saw begin and draws none.
+func TestLiveInkStartIsNotFilteredByViewerPage(t *testing.T) {
+	rooms, interest := newRoomsWithInterest()
+	sender := newFakeConnection("c1", "s1", "u1", "note-1")
+	viewer := newFakeConnection("c2", "s2", "u2", "note-1")
+	rooms.Join(sender)
+	rooms.Join(viewer)
+
+	interest.Update(viewer, mustJSON(t, map[string]any{
+		"pageId": "page-2", "x": 0, "y": 0, "width": 100, "height": 100,
+	}))
+
+	rooms.Relay(sender, envelopeFor("ink.started", `{"strokeId":"s1","pageId":"page-1","points":[{"x":10,"y":10}]}`))
+	rooms.Relay(sender, envelopeFor("ink.points", `{"strokeId":"s1","points":[{"x":11,"y":11}]}`))
+	if got := len(viewer.events(false)); got != 2 {
+		t.Errorf("viewer got %d live-ink frames, want start and points", got)
+	}
+
+	// Spatial filtering still applies to everything else.
+	rooms.Relay(sender, envelopeFor("cursor.moved", `{"pageId":"page-1","x":10,"y":10}`))
+	if got := len(viewer.events(false)); got != 2 {
+		t.Error("a cursor on another page must still be filtered")
+	}
+}
+
 func TestRelayHonoursRecipientPreviewPreferencesButNeverSuppressesCommits(t *testing.T) {
 	rooms, interest := newRoomsWithInterest()
 	sender := newFakeConnection("c1", "s1", "u1", "note-1")

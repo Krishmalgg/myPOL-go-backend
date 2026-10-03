@@ -27,6 +27,8 @@ type frameDeps struct {
 	newID       func() string
 	relay       func(domain.Connection, *domain.Envelope)
 	authRefresh func(domain.Connection, json.RawMessage)
+	// touchSession records a session's liveness (plan P4.3).
+	touchSession func(sessionID string, now time.Time)
 	// blockLock consumes the lock verbs, reporting true when it handled the
 	// frame so the caller does not also relay it.
 	blockLock blockLockHandler
@@ -60,10 +62,14 @@ func newAuthRefreshHandler(
 	newID func() string,
 	now application.Clock,
 	logger *slog.Logger,
+	metrics *observability.Metrics,
 ) func(domain.Connection, json.RawMessage) {
 	return func(connection domain.Connection, payload json.RawMessage) {
 		var parsed authRefreshPayload
 		if err := json.Unmarshal(payload, &parsed); err != nil || parsed.Token == "" {
+			if metrics != nil {
+				metrics.AuthRefreshRejected.Add(1)
+			}
 			reply(connection, newID(), now, EventAuthRejected, map[string]any{
 				"reason": "missing-token",
 			})
@@ -73,9 +79,12 @@ func newAuthRefreshHandler(
 		session, err := sessions.RefreshSession(connection.SessionID(), parsed.Token)
 		if err != nil {
 			// Never echo the validation detail: it tells a forger which part of
-			// the token to fix next.
-			logger.Debug("auth refresh rejected",
-				"connectionId", connection.ID(), "error", err)
+			// the token to fix next. The server log may have it (plan P4.1).
+			if metrics != nil {
+				metrics.AuthRefreshRejected.Add(1)
+			}
+			logger.Info("auth refresh rejected",
+				"connectionId", connection.ID(), "sessionId", connection.SessionID(), "error", err)
 			reply(connection, newID(), now, EventAuthRejected, map[string]any{
 				"reason": "rejected",
 			})
@@ -88,6 +97,9 @@ func newAuthRefreshHandler(
 			rooms.ApplyPermission(session.ID, session.Permission)
 		}
 
+		if metrics != nil {
+			metrics.AuthRefreshAccepted.Add(1)
+		}
 		reply(connection, newID(), now, EventAuthRefreshed, map[string]any{
 			"sessionId":  session.ID,
 			"permission": session.Permission.String(),
@@ -241,10 +253,18 @@ func runWebTransportSession(
 		"permission", connection.Permission().String())
 
 	frames := deps.frameDeps()
+	connection.markActivity(now)
 
 	// Datagrams and the control stream are independent sources, so each gets its
-	// own reader; whichever ends first tears the session down.
-	done := make(chan struct{}, 2)
+	// own reader; whichever ends first tears the session down. Idleness is judged
+	// across both by a watchdog: a per-read deadline on datagrams alone reaped a
+	// client whose only traffic was reliable (its heartbeat, plan P4.3).
+	done := make(chan struct{}, 3)
+
+	go func() {
+		defer func() { done <- struct{}{} }()
+		watchIdle(ctx, connection, deps.IdleTimeout, deps.Now)
+	}()
 
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -253,19 +273,22 @@ func runWebTransportSession(
 
 	go func() {
 		defer func() { done <- struct{}{} }()
-		_ = readStreamFrames(stream, func(payload []byte) {
+		err := readStreamFrames(stream, func(payload []byte) {
+			connection.markActivity(deps.Now())
 			handleClientFrame(frames, connection, limits, payload)
 		})
+		connection.Close(wtReadEndReason(err, CloseReasonStreamEnded))
 	}()
 
 	select {
 	case <-ctx.Done():
+		connection.Close("server shutdown")
 	case <-done:
 	}
 
 	deps.Logger.Info("webtransport session closed",
-		"connectionId", connection.ID(),
-		"droppedFrames", connection.Dropped())
+		append(recordClose(deps.Metrics, connection, "webtransport", now, deps.Now()),
+			"droppedFrames", connection.Dropped())...)
 }
 
 func readDatagrams(
@@ -277,17 +300,38 @@ func readDatagrams(
 	session *webtransport.Session,
 ) {
 	for {
-		// An idle session is reaped: a client that stops sending — including one
-		// whose network vanished without a close — must not hold a slot.
-		readCtx, cancel := context.WithTimeout(ctx, deps.IdleTimeout)
-		payload, err := session.ReceiveDatagram(readCtx)
-		cancel()
-
+		payload, err := session.ReceiveDatagram(ctx)
 		if err != nil {
-			connection.Close("datagram read ended")
+			connection.Close(wtReadEndReason(err, "datagram read ended"))
 			return
 		}
+		connection.markActivity(deps.Now())
 		handleClientFrame(frames, connection, limits, payload)
+	}
+}
+
+// watchIdle reaps a session whose client has sent nothing, on either the
+// datagram or the stream path, for longer than the idle timeout: a client whose
+// network vanished without a close must not hold a slot.
+func watchIdle(ctx context.Context, connection *wtConnection, idleTimeout time.Duration, now application.Clock) {
+	interval := idleTimeout / 4
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-connection.closed:
+			return
+		case <-ticker.C:
+			if connection.idleFor(now()) > idleTimeout {
+				connection.Close(CloseReasonIdle)
+				return
+			}
+		}
 	}
 }
 
@@ -298,7 +342,8 @@ func (d WebTransportDeps) frameDeps() frameDeps {
 		relay: func(connection domain.Connection, envelope *domain.Envelope) {
 			d.Rooms.Relay(connection, envelope)
 		},
-		authRefresh:             newAuthRefreshHandler(d.Sessions, d.Rooms, d.NewID, d.Now, d.Logger),
+		authRefresh:             newAuthRefreshHandler(d.Sessions, d.Rooms, d.NewID, d.Now, d.Logger, d.Metrics),
+		touchSession:            func(sessionID string, now time.Time) { _ = d.Sessions.Touch(sessionID, now) },
 		blockLock:               newBlockLockHandler(d.Locks, d.Rooms, d.Metrics),
 		transformGuard:          newTransformGuard(d.Locks, d.Rooms, d.Metrics),
 		interestUpdate:          newInterestUpdateHandler(d.Interest, d.Metrics),
@@ -315,7 +360,8 @@ func (d WebSocketDeps) frameDeps() frameDeps {
 		relay: func(connection domain.Connection, envelope *domain.Envelope) {
 			d.Rooms.Relay(connection, envelope)
 		},
-		authRefresh:             newAuthRefreshHandler(d.Sessions, d.Rooms, d.NewID, d.Now, d.Logger),
+		authRefresh:             newAuthRefreshHandler(d.Sessions, d.Rooms, d.NewID, d.Now, d.Logger, d.Metrics),
+		touchSession:            func(sessionID string, now time.Time) { _ = d.Sessions.Touch(sessionID, now) },
 		blockLock:               newBlockLockHandler(d.Locks, d.Rooms, d.Metrics),
 		transformGuard:          newTransformGuard(d.Locks, d.Rooms, d.Metrics),
 		interestUpdate:          newInterestUpdateHandler(d.Interest, d.Metrics),

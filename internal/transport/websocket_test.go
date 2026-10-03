@@ -17,6 +17,7 @@ import (
 	"mypol/go-realtime/internal/config"
 	"mypol/go-realtime/internal/domain"
 	"mypol/go-realtime/internal/infrastructure"
+	"mypol/go-realtime/internal/observability"
 	"mypol/go-realtime/internal/security"
 	"mypol/go-realtime/internal/testsupport"
 )
@@ -31,9 +32,12 @@ type wsHarness struct {
 	locks    *application.BlockLockService
 	interest *application.InterestService
 	health   *Health
+	metrics  *observability.Metrics
 }
 
-func newWSHarness(t *testing.T) *wsHarness {
+func newWSHarness(t *testing.T) *wsHarness { return newWSHarnessWithIdle(t, 5*time.Second) }
+
+func newWSHarnessWithIdle(t *testing.T, idleTimeout time.Duration) *wsHarness {
 	t.Helper()
 
 	keys, err := testsupport.NewKeyPair()
@@ -97,7 +101,7 @@ func newWSHarness(t *testing.T) *wsHarness {
 		},
 		EphemeralQueue: 64,
 		ReliableQueue:  128,
-		IdleTimeout:    5 * time.Second,
+		IdleTimeout:    idleTimeout,
 		NewID:          newID,
 		Now:            clock,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -112,6 +116,7 @@ func newWSHarness(t *testing.T) *wsHarness {
 		locks:    locks,
 		interest: interest,
 		health:   health,
+		metrics:  handlers.Metrics(),
 	}
 	t.Cleanup(harness.server.Close)
 	return harness

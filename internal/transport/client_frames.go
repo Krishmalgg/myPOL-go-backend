@@ -2,6 +2,7 @@ package transport
 
 import (
 	"encoding/json"
+	"time"
 
 	"mypol/go-realtime/internal/application"
 	"mypol/go-realtime/internal/codec"
@@ -27,7 +28,20 @@ const (
 	EventAuthRefreshed        = "auth.refreshed"
 	EventAuthRejected         = "auth.rejected"
 	EventProtocolCapabilities = "protocol.capabilities"
+	// EventHeartbeat keeps a quiet client's connection and session alive
+	// (plan P4.3); the ack tells the client the server is still there.
+	EventHeartbeat    = "heartbeat"
+	EventHeartbeatAck = "heartbeat.ack"
 )
+
+// sessionTouchInterval bounds how often one connection touches its session.
+const sessionTouchInterval = time.Second
+
+// liveConnection is implemented by every transport's connection; it is optional
+// so test doubles of domain.Connection need not provide it.
+type liveConnection interface {
+	shouldTouch(now time.Time, interval time.Duration) bool
+}
 
 // handleClientFrame validates one inbound client message and relays it.
 //
@@ -75,6 +89,12 @@ func handleClientFrame(
 	class := domain.ClassifyEvent(envelope.Event)
 	now := deps.now()
 
+	// Any well-formed frame proves the client is alive, whatever happens to
+	// it next, so the session is not swept from under a busy socket.
+	if live, ok := connection.(liveConnection); ok && deps.touchSession != nil && live.shouldTouch(now, sessionTouchInterval) {
+		deps.touchSession(connection.SessionID(), now)
+	}
+
 	if !limits.Allow(class, now) {
 		deps.debug("rate limited", "connectionId", connection.ID(), "event", envelope.Event)
 		return
@@ -85,6 +105,12 @@ func handleClientFrame(
 			"connectionId", connection.ID(),
 			"event", envelope.Event,
 			"permission", connection.Permission().String())
+		return
+	}
+
+	// A heartbeat is for the server alone; the reply goes to the sender only.
+	if envelope.Event == EventHeartbeat {
+		reply(connection, deps.newID(), deps.now, EventHeartbeatAck, map[string]any{"serverTime": now.UnixMilli()})
 		return
 	}
 

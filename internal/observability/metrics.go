@@ -9,6 +9,8 @@ package observability
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -19,8 +21,8 @@ type Metrics struct {
 	ActiveConnections atomic.Int64
 	ActiveRooms       atomic.Int64
 
-	MessagesIn  atomic.Int64
-	MessagesOut atomic.Int64
+	MessagesIn    atomic.Int64
+	MessagesOut   atomic.Int64
 	IncomingBytes atomic.Int64
 	OutgoingBytes atomic.Int64
 
@@ -28,6 +30,10 @@ type Metrics struct {
 	// previews is the design working, not a fault. It matters as a rate, not
 	// as a total.
 	DroppedEphemeral atomic.Int64
+	// DroppedInk is the live-ink share of DroppedEphemeral. Unlike a superseded
+	// cursor, every dropped ink frame is a gap in someone's line, so this one
+	// should stay at zero outside real overload.
+	DroppedInk atomic.Int64
 	// ReliableOverflow is the opposite: any value above zero means a client was
 	// disconnected because final state could not be delivered.
 	ReliableOverflow atomic.Int64
@@ -74,9 +80,49 @@ type Metrics struct {
 	// their reported interest excluded it — the fan-out this whole feature
 	// exists to avoid, made visible as a number.
 	InterestFilteredTotal atomic.Int64
+
+	// closedByReason counts disconnects by reason (plan P4.1). Recorded once
+	// per connection, off the relay path, so a mutex is fine.
+	closeMu        sync.Mutex
+	closedByReason map[string]int64
 }
 
 func New() *Metrics { return &Metrics{} }
+
+// maxCloseReasons bounds the map; reasons are a fixed vocabulary, so hitting
+// it means a new one appeared, and it is still counted as "other".
+const maxCloseReasons = 32
+
+// ObserveClose counts one disconnect. The detail in brackets (a client's close
+// code) belongs in the log, not in a metric key: "client closed (1001)" counts
+// as "client closed".
+func (m *Metrics) ObserveClose(reason string) {
+	if i := strings.Index(reason, " ("); i >= 0 {
+		reason = reason[:i]
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	if m.closedByReason == nil {
+		m.closedByReason = make(map[string]int64)
+	}
+	if _, known := m.closedByReason[reason]; !known && len(m.closedByReason) >= maxCloseReasons {
+		reason = "other"
+	}
+	m.closedByReason[reason]++
+}
+
+func (m *Metrics) closeCounts() map[string]int64 {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	counts := make(map[string]int64, len(m.closedByReason))
+	for reason, count := range m.closedByReason {
+		counts[reason] = count
+	}
+	return counts
+}
 
 // Snapshot is the JSON shape served by the metrics endpoint.
 type Snapshot struct {
@@ -84,13 +130,14 @@ type Snapshot struct {
 	ActiveConnections int64 `json:"activeConnections"`
 	ActiveRooms       int64 `json:"activeRooms"`
 
-	MessagesIn  int64 `json:"messagesInTotal"`
-	MessagesOut int64 `json:"messagesOutTotal"`
+	MessagesIn    int64 `json:"messagesInTotal"`
+	MessagesOut   int64 `json:"messagesOutTotal"`
 	IncomingBytes int64 `json:"incomingBytesTotal"`
 	OutgoingBytes int64 `json:"outgoingBytesTotal"`
 
-	DroppedEphemeral int64 `json:"droppedEphemeralTotal"`
-	ReliableOverflow int64 `json:"reliableOverflowTotal"`
+	DroppedEphemeral       int64 `json:"droppedEphemeralTotal"`
+	DroppedInk             int64 `json:"droppedInkTotal"`
+	ReliableOverflow       int64 `json:"reliableOverflowTotal"`
 	ReliableQueueDepthMax  int64 `json:"reliableQueueDepthMax"`
 	EphemeralQueueDepthMax int64 `json:"ephemeralQueueDepthMax"`
 
@@ -123,40 +170,45 @@ type Snapshot struct {
 	// there is nothing to keep in sync because it is computed fresh from
 	// whatever they currently hold.
 	InterestRecipientsPerEvent float64 `json:"interestRecipientsPerEvent"`
+
+	ConnectionsClosedByReason map[string]int64 `json:"connectionsClosedByReason"`
 }
 
 func (m *Metrics) Snapshot() Snapshot {
 	snapshot := Snapshot{
-		ActiveSessions:      m.ActiveSessions.Load(),
-		ActiveConnections:   m.ActiveConnections.Load(),
-		ActiveRooms:         m.ActiveRooms.Load(),
-		MessagesIn:          m.MessagesIn.Load(),
-		MessagesOut:         m.MessagesOut.Load(),
-		IncomingBytes:       m.IncomingBytes.Load(),
-		OutgoingBytes:       m.OutgoingBytes.Load(),
-		DroppedEphemeral:    m.DroppedEphemeral.Load(),
-		ReliableOverflow:    m.ReliableOverflow.Load(),
+		ActiveSessions:         m.ActiveSessions.Load(),
+		ActiveConnections:      m.ActiveConnections.Load(),
+		ActiveRooms:            m.ActiveRooms.Load(),
+		MessagesIn:             m.MessagesIn.Load(),
+		MessagesOut:            m.MessagesOut.Load(),
+		IncomingBytes:          m.IncomingBytes.Load(),
+		OutgoingBytes:          m.OutgoingBytes.Load(),
+		DroppedEphemeral:       m.DroppedEphemeral.Load(),
+		DroppedInk:             m.DroppedInk.Load(),
+		ReliableOverflow:       m.ReliableOverflow.Load(),
 		ReliableQueueDepthMax:  m.ReliableQueueDepthMax.Load(),
 		EphemeralQueueDepthMax: m.EphemeralQueueDepthMax.Load(),
-		RateLimited:         m.RateLimited.Load(),
-		PermissionDenied:    m.PermissionDenied.Load(),
-		SessionAuthFailures: m.SessionAuthFailures.Load(),
-		HMACAuthFailures:    m.HMACAuthFailures.Load(),
-		BootstrapThrottled:  m.BootstrapThrottled.Load(),
-		TicketsIssued:       m.TicketsIssued.Load(),
-		TicketsConsumed:     m.TicketsConsumed.Load(),
-		TicketsExpired:      m.TicketsExpired.Load(),
-		SignalingRelayed:    m.SignalingRelayed.Load(),
-		SignalingRefused:    m.SignalingRefused.Load(),
-		AuthRefreshAccepted: m.AuthRefreshAccepted.Load(),
-		AuthRefreshRejected: m.AuthRefreshRejected.Load(),
-		BlockLocksActive:    m.BlockLocksActive.Load(),
-		BlockLockDenied:     m.BlockLockDenied.Load(),
+		RateLimited:            m.RateLimited.Load(),
+		PermissionDenied:       m.PermissionDenied.Load(),
+		SessionAuthFailures:    m.SessionAuthFailures.Load(),
+		HMACAuthFailures:       m.HMACAuthFailures.Load(),
+		BootstrapThrottled:     m.BootstrapThrottled.Load(),
+		TicketsIssued:          m.TicketsIssued.Load(),
+		TicketsConsumed:        m.TicketsConsumed.Load(),
+		TicketsExpired:         m.TicketsExpired.Load(),
+		SignalingRelayed:       m.SignalingRelayed.Load(),
+		SignalingRefused:       m.SignalingRefused.Load(),
+		AuthRefreshAccepted:    m.AuthRefreshAccepted.Load(),
+		AuthRefreshRejected:    m.AuthRefreshRejected.Load(),
+		BlockLocksActive:       m.BlockLocksActive.Load(),
+		BlockLockDenied:        m.BlockLockDenied.Load(),
 
 		InterestUpdatesTotal:    m.InterestUpdatesTotal.Load(),
 		InterestEventsTotal:     m.InterestEventsTotal.Load(),
 		InterestRecipientsTotal: m.InterestRecipientsTotal.Load(),
 		InterestFilteredTotal:   m.InterestFilteredTotal.Load(),
+
+		ConnectionsClosedByReason: m.closeCounts(),
 	}
 	if snapshot.InterestEventsTotal > 0 {
 		snapshot.InterestRecipientsPerEvent =

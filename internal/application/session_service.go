@@ -213,6 +213,13 @@ func (s *SessionService) UpdateSessionPermission(sessionID string, permission do
 	return s.sessions.UpdatePermission(sessionID, permission)
 }
 
+// Touch records that a session's client is still talking (plan P4.3). Without
+// it a session is swept SESSION_IDLE_TIMEOUT after bootstrap however busy its
+// socket is, and the next auth.refresh is rejected as "session not found".
+func (s *SessionService) Touch(sessionID string, now time.Time) error {
+	return s.sessions.Touch(sessionID, now)
+}
+
 // SweepTickets drops unredeemed tickets past their TTL.
 func (s *SessionService) SweepTickets() int {
 	return s.tickets.SweepExpired(s.now())

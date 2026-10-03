@@ -135,10 +135,11 @@ func (c *wtConnection) SendReliable(envelope *domain.Envelope) error {
 }
 
 func (c *wtConnection) SendEphemeral(envelope *domain.Envelope, coalesceKey string) {
-	droppedBefore := c.Dropped()
+	droppedBefore, inkBefore := c.Dropped(), c.DroppedInk()
 	c.pushEphemeral(envelope, coalesceKey)
 	if c.metrics != nil {
 		c.metrics.DroppedEphemeral.Add(int64(c.Dropped() - droppedBefore))
+		c.metrics.DroppedInk.Add(int64(c.DroppedInk() - inkBefore))
 		c.metrics.ObserveQueueDepth(c.PendingReliable(), c.PendingEphemeral())
 	}
 }
@@ -147,7 +148,7 @@ func (c *wtConnection) PendingReliable() int { return c.outboundQueues.PendingRe
 
 func (c *wtConnection) Close(reason string) {
 	alreadyClosed := c.isClosed()
-	c.markClosed()
+	c.markClosedWith(reason)
 	if alreadyClosed {
 		return
 	}

@@ -50,6 +50,25 @@ func TestEphemeralQueueShedsOldestWhenSaturated(t *testing.T) {
 	}
 }
 
+// A superseded cursor and a shed ink frame both count as dropped, but only the
+// ink one is a visible gap, so it must be countable on its own.
+func TestDroppedInkCountsOnlyInkFrames(t *testing.T) {
+	q := newOutboundQueues(2, 8)
+
+	q.pushEphemeral(frame("cursor.moved"), "cursor:a")
+	q.pushEphemeral(frame("cursor.moved"), "cursor:a") // coalesced cursor
+	if q.Dropped() != 1 || q.DroppedInk() != 0 {
+		t.Fatalf("after cursor coalesce: dropped=%d ink=%d, want 1/0", q.Dropped(), q.DroppedInk())
+	}
+
+	q.pushEphemeral(frame("ink.points"), "ink:1")
+	q.pushEphemeral(frame("ink.points"), "ink:2") // sheds the cursor, the oldest
+	q.pushEphemeral(frame("ink.points"), "ink:3") // sheds ink:1
+	if q.Dropped() != 3 || q.DroppedInk() != 1 {
+		t.Fatalf("after shedding: dropped=%d ink=%d, want 3/1", q.Dropped(), q.DroppedInk())
+	}
+}
+
 func TestEphemeralBatchPreservesOneNewestFramePerStream(t *testing.T) {
 	q := newOutboundQueues(8, 8)
 	q.pushEphemeral(frame("old"), "cursor:a")
