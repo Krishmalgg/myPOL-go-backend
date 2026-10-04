@@ -73,20 +73,23 @@ var signalingEvents = map[string]struct{}{
 }
 
 var reliableEvents = map[string]struct{}{
-	"ink.commit":             {},
-	"ink.patch":              {},
-	"ink.ended":              {},
-	"block.transform.commit": {},
-	"block.lock.request":     {},
-	"block.lock.renew":       {},
-	"block.lock.release":     {},
-	"block.created":          {},
-	"block.status":           {},
-	"auth.refresh":           {},
-	"heartbeat":              {},
-	"server.draining":        {},
-	"interest.update":        {},
-	"yjs.update":             {},
+	"ink.commit":                {},
+	"ink.patch":                 {},
+	"history.preview":           {},
+	"history.preview.cancel":    {},
+	"history.preview.confirmed": {},
+	"ink.ended":                 {},
+	"block.transform.commit":    {},
+	"block.lock.request":        {},
+	"block.lock.renew":          {},
+	"block.lock.release":        {},
+	"block.created":             {},
+	"block.status":              {},
+	"auth.refresh":              {},
+	"heartbeat":                 {},
+	"server.draining":           {},
+	"interest.update":           {},
+	"yjs.update":                {},
 }
 
 // durablePrefixes are announcements from .NET about persisted state.
