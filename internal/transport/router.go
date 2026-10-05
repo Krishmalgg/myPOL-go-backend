@@ -28,6 +28,8 @@ func NewRouter(h *Handlers, allowedOrigins []string, websocket http.HandlerFunc)
 	}
 
 	mux.HandleFunc("POST /internal/v1/sessions/revoke", h.RevokeSession)
+	mux.HandleFunc("POST /internal/v1/history/previews", h.RegisterHistoryPreview)
+	mux.HandleFunc("POST /internal/v1/notes/{noteId}/users/{userId}/history/revoke", h.RevokeHistoryPreviews)
 	mux.HandleFunc("POST /internal/v1/sessions/permission", h.UpdateSessionPermission)
 	mux.HandleFunc("POST /internal/v1/notes/{noteId}/users/{userId}/revoke", h.RevokeUserFromNote)
 

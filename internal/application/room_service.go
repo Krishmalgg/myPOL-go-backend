@@ -55,10 +55,11 @@ type MessageIDFunc func() string
 // a later phase; wiring it in now would mean building spatial indexing before
 // there is any traffic to measure it against.
 type RoomService struct {
-	rooms     RoomStore
-	newID     MessageIDFunc
-	now       Clock
-	channelOf func(noteID string) string
+	HistoryPreviews HistoryPreviews
+	rooms           RoomStore
+	newID           MessageIDFunc
+	now             Clock
+	channelOf       func(noteID string) string
 
 	// deltaSeq gives every delta frame its own queue slot; see coalesceKey.
 	deltaSeq atomic.Uint64

@@ -23,10 +23,11 @@ const DefaultMaxDatagramBytes = 1100
 // frameDeps is the slice of transport wiring that inbound frame handling needs,
 // kept narrow so `handleClientFrame` cannot reach for anything else.
 type frameDeps struct {
-	now         application.Clock
-	newID       func() string
-	relay       func(domain.Connection, *domain.Envelope)
-	authRefresh func(domain.Connection, json.RawMessage)
+	historyPreview func(domain.Connection, json.RawMessage, time.Time) (json.RawMessage, bool)
+	now            application.Clock
+	newID          func() string
+	relay          func(domain.Connection, *domain.Envelope)
+	authRefresh    func(domain.Connection, json.RawMessage)
 	// touchSession records a session's liveness (plan P4.3).
 	touchSession func(sessionID string, now time.Time)
 	// blockLock consumes the lock verbs, reporting true when it handled the
@@ -337,8 +338,9 @@ func watchIdle(ctx context.Context, connection *wtConnection, idleTimeout time.D
 
 func (d WebTransportDeps) frameDeps() frameDeps {
 	return frameDeps{
-		now:   d.Now,
-		newID: d.NewID,
+		historyPreview: d.Rooms.HistoryPreviews.Resolve,
+		now:            d.Now,
+		newID:          d.NewID,
 		relay: func(connection domain.Connection, envelope *domain.Envelope) {
 			d.Rooms.Relay(connection, envelope)
 		},
@@ -355,8 +357,9 @@ func (d WebTransportDeps) frameDeps() frameDeps {
 
 func (d WebSocketDeps) frameDeps() frameDeps {
 	return frameDeps{
-		now:   d.Now,
-		newID: d.NewID,
+		historyPreview: d.Rooms.HistoryPreviews.Resolve,
+		now:            d.Now,
+		newID:          d.NewID,
 		relay: func(connection domain.Connection, envelope *domain.Envelope) {
 			d.Rooms.Relay(connection, envelope)
 		},

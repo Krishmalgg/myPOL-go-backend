@@ -156,6 +156,17 @@ func handleClientFrame(
 		return
 	}
 
+	if envelope.Event == "history.preview" {
+		if deps.historyPreview == nil {
+			return
+		}
+		payload, allowed := deps.historyPreview(connection, envelope.Payload, now)
+		if !allowed {
+			return
+		}
+		envelope.Payload = payload
+	}
+
 	// Identity and channel come from the authenticated connection, never from
 	// the client's own claims — otherwise a client could publish into another
 	// note's room or forge another user's cursor.

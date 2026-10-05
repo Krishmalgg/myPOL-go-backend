@@ -337,6 +337,7 @@ func (h *Handlers) RevokeUserFromNote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	disconnected := h.rooms.DisconnectUserFromNote(noteID, userID, "access revoked")
+	h.rooms.HistoryPreviews.Revoke(noteID, userID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"revokedSessions": removed,

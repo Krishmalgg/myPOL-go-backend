@@ -145,7 +145,7 @@ func (p Permission) MayPublish(event string) bool {
 	case ClassSignaling:
 		return true
 	default:
-		if strings.HasPrefix(event, "ink.") || strings.HasPrefix(event, "block.") {
+		if strings.HasPrefix(event, "ink.") || strings.HasPrefix(event, "block.") || strings.HasPrefix(event, "history.") {
 			return p.CanDraw()
 		}
 		return true
