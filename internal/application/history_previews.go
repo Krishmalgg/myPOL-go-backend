@@ -65,6 +65,7 @@ func (p *HistoryPreviews) Resolve(connection domain.Connection, raw json.RawMess
 		PermitID  string `json:"permitId"`
 		RequestID string `json:"requestId"`
 		Ordinal   uint64 `json:"ordinal"`
+		Redo      bool   `json:"redo"`
 	}
 	if len(raw) > 1024 || json.Unmarshal(raw, &request) != nil || request.PermitID == "" || request.RequestID == "" || len(request.RequestID) > 64 || request.Ordinal == 0 {
 		return nil, false
@@ -84,6 +85,7 @@ func (p *HistoryPreviews) Resolve(connection domain.Connection, raw json.RawMess
 		Ordinal   uint64          `json:"ordinal"`
 		ExpiresAt int64           `json:"expiresAt"`
 		Preview   json.RawMessage `json:"preview"`
-	}{1, request.RequestID, request.Ordinal, permit.ExpiresAt, permit.Payload})
+		Redo      bool            `json:"redo"`
+	}{1, request.RequestID, request.Ordinal, permit.ExpiresAt, permit.Payload, request.Redo})
 	return payload, err == nil
 }
