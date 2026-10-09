@@ -90,6 +90,8 @@ var reliableEvents = map[string]struct{}{
 	"server.draining":           {},
 	"interest.update":           {},
 	"yjs.update":                {},
+	// A collaborator's current selection; others treat it as held (advisory).
+	"selection.lock": {},
 }
 
 // durablePrefixes are announcements from .NET about persisted state.
@@ -145,7 +147,8 @@ func (p Permission) MayPublish(event string) bool {
 	case ClassSignaling:
 		return true
 	default:
-		if strings.HasPrefix(event, "ink.") || strings.HasPrefix(event, "block.") || strings.HasPrefix(event, "history.") {
+		if strings.HasPrefix(event, "ink.") || strings.HasPrefix(event, "block.") || strings.HasPrefix(event, "history.") ||
+			strings.HasPrefix(event, "selection.") {
 			return p.CanDraw()
 		}
 		return true

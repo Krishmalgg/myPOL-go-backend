@@ -145,3 +145,20 @@ func TestInkPatchRequiresWritePermission(t *testing.T) {
 		t.Fatal("editors must be able to edit ink")
 	}
 }
+
+// Holding a selection stops others editing those items, so only editors may.
+func TestSelectionLockRequiresWritePermission(t *testing.T) {
+	if ClassifyEvent("selection.lock") != ClassReliable {
+		t.Fatal("selection locks must be reliable: a dropped release leaves items held")
+	}
+	for _, value := range []string{"view", "comment"} {
+		permission, _ := ParsePermission(value)
+		if permission.MayPublish("selection.lock") {
+			t.Fatalf("%s may not hold a selection", value)
+		}
+	}
+	permission, _ := ParsePermission("edit")
+	if !permission.MayPublish("selection.lock") {
+		t.Fatal("editors must be able to hold a selection")
+	}
+}
