@@ -119,6 +119,7 @@ func newWSHarnessWithIdle(t *testing.T, idleTimeout time.Duration) *wsHarness {
 		metrics:  handlers.Metrics(),
 	}
 	t.Cleanup(harness.server.Close)
+	cfg.WebSocketURL = "ws" + strings.TrimPrefix(harness.server.URL, "http") + "/ws"
 	return harness
 }
 
